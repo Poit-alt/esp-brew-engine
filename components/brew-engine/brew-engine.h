@@ -40,6 +40,7 @@
 #include "notification.h"
 
 #include "settings-manager.h"
+#include "statistics-manager.h"
 
 #include "nlohmann_json.hpp"
 
@@ -117,6 +118,7 @@ private:
     static string to_iso_8601(std::chrono::time_point<std::chrono::system_clock> t);
 
     SettingsManager *settingsManager;
+    StatisticsManager *statisticsManager;
     httpd_handle_t server;
 
     TemperatureScale temperatureScale = Celsius;

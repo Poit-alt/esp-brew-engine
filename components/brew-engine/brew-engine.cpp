@@ -16,6 +16,7 @@ BrewEngine::BrewEngine(SettingsManager *settingsManager)
 {
 	ESP_LOGI(TAG, "BrewEngine Construct");
 	this->settingsManager = settingsManager;
+	this->statisticsManager = new StatisticsManager(settingsManager);
 	mainInstance = this;
 }
 
@@ -69,6 +70,8 @@ void BrewEngine::Init()
 	this->detectOnewireTemperatureSensors();
 
 	this->initMqtt();
+
+	this->statisticsManager->Init();
 
 	this->run = true;
 
@@ -1359,6 +1362,9 @@ void BrewEngine::readLoop(void *arg)
 					instance->tempLog.insert(std::make_pair(current_raw_time, (int)avg));
 
 					ESP_LOGI(TAG, "Logging: %d°", (int)avg);
+					
+					// Add statistics data point
+					instance->statisticsManager->AddDataPoint(current_raw_time, (int8_t)avg, (int8_t)instance->targetTemperature, instance->pidOutput);
 				}
 				else
 				{
@@ -1972,6 +1978,7 @@ string BrewEngine::processCommand(const string &payLoad)
 		}
 
 		this->start();
+		this->statisticsManager->StartSession(this->selectedMashScheduleName);
 	}
 	else if (command == "StartStir")
 	{
@@ -1980,6 +1987,7 @@ string BrewEngine::processCommand(const string &payLoad)
 	else if (command == "Stop")
 	{
 		this->stop();
+		this->statisticsManager->EndSession();
 	}
 	else if (command == "StopStir")
 	{
@@ -2162,6 +2170,131 @@ string BrewEngine::processCommand(const string &payLoad)
 		{
 			xTaskCreate(&this->reboot, "reboot_task", 1024, this, 5, NULL);
 		}
+	}
+	else if (command == "GetStatistics")
+	{
+		vector<BrewSession> sessions = this->statisticsManager->GetSessionList();
+		json jSessions = json::array();
+		
+		for (const auto& session : sessions) {
+			json jSession;
+			jSession["sessionId"] = session.sessionId;
+			jSession["scheduleName"] = session.scheduleName;
+			jSession["startTime"] = session.startTime;
+			jSession["endTime"] = session.endTime;
+			jSession["duration"] = session.totalDuration;
+			jSession["dataPoints"] = session.dataPoints;
+			jSession["avgTemperature"] = session.avgTemperature;
+			jSession["minTemperature"] = session.minTemperature;
+			jSession["maxTemperature"] = session.maxTemperature;
+			jSession["completed"] = session.completed;
+			jSessions.push_back(jSession);
+		}
+		
+		resultData["sessions"] = jSessions;
+		
+		map<string, uint32_t> stats = this->statisticsManager->GetSessionStats();
+		resultData["stats"] = stats;
+		
+		json jConfig;
+		jConfig["maxSessions"] = this->statisticsManager->GetMaxSessions();
+		jConfig["currentSessionActive"] = this->statisticsManager->IsSessionActive();
+		if (this->statisticsManager->IsSessionActive()) {
+			jConfig["currentSessionId"] = this->statisticsManager->GetCurrentSessionId();
+			jConfig["currentDataPoints"] = this->statisticsManager->GetCurrentSessionDataPoints();
+		}
+		resultData["config"] = jConfig;
+	}
+	else if (command == "GetSessionData")
+	{
+		if (data["sessionId"].is_null()) {
+			message = "Session ID required";
+			success = false;
+		}
+		else {
+			uint32_t sessionId = data["sessionId"];
+			BrewSession session = this->statisticsManager->GetSessionById(sessionId);
+			
+			if (session.sessionId == 0) {
+				message = "Session not found";
+				success = false;
+			}
+			else {
+				vector<TempDataPoint> sessionData = this->statisticsManager->GetSessionData(sessionId);
+				
+				json jSession;
+				jSession["sessionId"] = session.sessionId;
+				jSession["scheduleName"] = session.scheduleName;
+				jSession["startTime"] = session.startTime;
+				jSession["endTime"] = session.endTime;
+				jSession["duration"] = session.totalDuration;
+				jSession["avgTemperature"] = session.avgTemperature;
+				jSession["minTemperature"] = session.minTemperature;
+				jSession["maxTemperature"] = session.maxTemperature;
+				jSession["completed"] = session.completed;
+				
+				json jData = json::array();
+				for (const auto& point : sessionData) {
+					json jPoint;
+					jPoint["timestamp"] = point.timestamp;
+					jPoint["avgTemp"] = (int)point.avgTemp;
+					jPoint["targetTemp"] = (int)point.targetTemp;
+					jPoint["pidOutput"] = (int)point.pidOutput;
+					jData.push_back(jPoint);
+				}
+				
+				jSession["data"] = jData;
+				resultData = jSession;
+			}
+		}
+	}
+	else if (command == "ExportSession")
+	{
+		if (data["sessionId"].is_null()) {
+			message = "Session ID required";
+			success = false;
+		}
+		else {
+			uint32_t sessionId = data["sessionId"];
+			string format = data.value("format", "json");
+			
+			if (format == "json") {
+				string exportData = this->statisticsManager->ExportSessionToJson(sessionId);
+				if (exportData == "{}") {
+					message = "Session not found";
+					success = false;
+				}
+				else {
+					resultData["exportData"] = exportData;
+					resultData["format"] = "json";
+				}
+			}
+			else if (format == "csv") {
+				string exportData = this->statisticsManager->ExportSessionToCsv(sessionId);
+				if (exportData.empty()) {
+					message = "Session not found or no data";
+					success = false;
+				}
+				else {
+					resultData["exportData"] = exportData;
+					resultData["format"] = "csv";
+				}
+			}
+			else {
+				message = "Invalid format. Use 'json' or 'csv'";
+				success = false;
+			}
+		}
+	}
+	else if (command == "SetStatisticsConfig")
+	{
+		if (!data["maxSessions"].is_null()) {
+			uint8_t maxSessions = data["maxSessions"];
+			this->statisticsManager->SetMaxSessions(maxSessions);
+		}
+		
+		resultData["maxSessions"] = this->statisticsManager->GetMaxSessions();
+		message = "Statistics configuration updated";
 	}
 
 	json jResultPayload;

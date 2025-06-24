@@ -30,6 +30,11 @@ const routes = [
         component: () => import(/* webpackChunkName: "Refractometer" */ "@/views/Refractometer.vue"),
       },
       {
+        path: "statistics",
+        name: "Statistics",
+        component: () => import(/* webpackChunkName: "Statistics" */ "@/views/Statistics.vue"),
+      },
+      {
         path: "mashschedules",
         name: "MashSchedules",
         component: () => import(/* webpackChunkName: "MashSchedules" */ "@/views/MashSchedules.vue"),
