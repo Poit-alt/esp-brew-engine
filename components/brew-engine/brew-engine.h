@@ -27,6 +27,7 @@
 
 #include "onewire_bus.h"
 #include "ds18b20.h"
+#include "max31865_driver.h"
 
 #include "mqtt_client.h"
 
@@ -45,6 +46,7 @@
 #include "nlohmann_json.hpp"
 
 #define ONEWIRE_MAX_DS18B20 10
+#define MAX_RTD_SENSORS 5
 
 enum TemperatureScale
 {
@@ -80,6 +82,10 @@ private:
     void readTempSensorSettings();
     void detectOnewireTemperatureSensors();
     void initOneWire();
+    void detectRtdTemperatureSensors();
+    void initRtdSensors();
+    void cleanupRtdSensors();
+    bool reinitializeRtdSensor(TemperatureSensor *sensor);
     void initMqtt();
     void initHeaters();
     void readSystemSettings();
@@ -175,6 +181,15 @@ private:
     gpio_num_t oneWire_PIN;
     gpio_num_t stir_PIN;
     gpio_num_t buzzer_PIN;
+
+    // MAX31865 RTD sensor configuration
+    gpio_num_t spi_mosi_pin;
+    gpio_num_t spi_miso_pin;
+    gpio_num_t spi_clk_pin;
+    gpio_num_t spi_cs_pin;
+    std::vector<max31865_t*> rtdSensors;
+    uint8_t rtdSensorCount;
+    bool rtdSensorsEnabled;
 
     uint8_t buzzerTime; // in seconds
 

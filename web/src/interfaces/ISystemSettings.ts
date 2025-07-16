@@ -8,4 +8,9 @@ export interface ISystemSettings {
   invertOutputs: boolean;
   mqttUri: string;
   temperatureScale: TemperatureScale;
+  rtdSensorsEnabled: boolean;
+  spiMosiPin: number;
+  spiMisoPin: number;
+  spiClkPin: number;
+  spiCsPin: number;
 }

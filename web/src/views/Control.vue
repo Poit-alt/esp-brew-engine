@@ -17,6 +17,7 @@ import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Line } from "vue-chartjs";
 import { useI18n } from "vue-i18n";
 import BoostStatus from "@/enums/BoostStatus";
+import { mdiThermometer } from "@mdi/js";
 const { t } = useI18n({ useScope: "global" });
 
 const webConn = inject<WebConn>("webConn");
@@ -292,10 +293,13 @@ const chartData = computed(() => {
   ];
 
   const extraDataSets = currentTemps.value.map((extraSet) => {
-    const setData = extraSet.temps.map((temp) => ({
-      x: temp.time * 1000,
-      y: temp.temp,
-    }));
+    // Filter out disconnected sensor readings (temp === -999)
+    const setData = extraSet.temps
+      .filter((temp) => temp.temp !== -999)
+      .map((temp) => ({
+        x: temp.time * 1000,
+        y: temp.temp,
+      }));
 
     let label = extraSet.sensor;
     let { color } = extraSet;
@@ -320,7 +324,7 @@ const chartData = computed(() => {
     };
 
     return dataset;
-  });
+  }).filter(dataset => dataset.data.length > 0); // Remove datasets with no valid data points
 
   datasets = [...datasets, ...extraDataSets];
 
@@ -328,6 +332,63 @@ const chartData = computed(() => {
     labels: [],
     datasets,
   };
+});
+
+const currentSensorStatus = computed(() => {
+  const sensorStatus: Array<{
+    id: string;
+    name: string;
+    color: string;
+    currentTemp: number;
+    lastUpdateTime: number;
+    timeSinceUpdate: string;
+    isConnected: boolean;
+  }> = [];
+
+  // Get all sensors that are configured to show on the chart
+  const displaySensors = tempSensors.value.filter(sensor => sensor.show);
+
+  displaySensors.forEach(sensor => {
+    // Find the current temperature data for this sensor
+    const sensorData = currentTemps.value.find(ct => ct.sensor === sensor.id);
+    
+    let currentTemp = sensor.lastTemp || 0;
+    let lastUpdateTime = 0;
+    let isConnected = currentTemp !== -999;
+
+    if (sensorData && sensorData.temps.length > 0) {
+      // Get the most recent temperature reading
+      const latestReading = sensorData.temps[sensorData.temps.length - 1];
+      currentTemp = latestReading.temp;
+      lastUpdateTime = latestReading.time;
+      isConnected = currentTemp !== -999;
+    }
+
+    // Calculate time since last update
+    const now = Math.floor(Date.now() / 1000);
+    const secondsSinceUpdate = lastUpdateTime > 0 ? now - lastUpdateTime : 0;
+    
+    let timeSinceUpdate = "";
+    if (secondsSinceUpdate < 60) {
+      timeSinceUpdate = `${secondsSinceUpdate}s ago`;
+    } else if (secondsSinceUpdate < 3600) {
+      timeSinceUpdate = `${Math.floor(secondsSinceUpdate / 60)}m ago`;
+    } else {
+      timeSinceUpdate = `${Math.floor(secondsSinceUpdate / 3600)}h ago`;
+    }
+
+    sensorStatus.push({
+      id: sensor.id,
+      name: sensor.name,
+      color: sensor.color,
+      currentTemp: isConnected ? currentTemp : -999,
+      lastUpdateTime,
+      timeSinceUpdate: lastUpdateTime > 0 ? timeSinceUpdate : "No data",
+      isConnected
+    });
+  });
+
+  return sensorStatus;
 });
 
 const clearAllNotificationTimeouts = () => {
@@ -722,6 +783,59 @@ const labelTargetTemp = computed(() => {
       <v-row style="height: 50vh">
         <Line v-if="chartInitDone && chartData" :options="chartOptions" :data="chartData" />
       </v-row>
+      
+      <!-- Sensor Status Display -->
+      <v-row v-if="currentSensorStatus.length > 0" class="mb-4">
+        <v-col cols="12">
+          <v-card variant="outlined">
+            <v-card-title class="text-h6 pb-2">
+              <v-icon class="mr-2">{{ mdiThermometer }}</v-icon>
+              Temperature Sensors
+            </v-card-title>
+            <v-card-text>
+              <v-row>
+                <v-col 
+                  v-for="sensor in currentSensorStatus" 
+                  :key="sensor.id"
+                  cols="12" 
+                  sm="6" 
+                  md="4" 
+                  lg="3"
+                >
+                  <v-card 
+                    :color="sensor.isConnected ? 'surface-variant' : 'error'" 
+                    variant="tonal"
+                    class="pa-3"
+                  >
+                    <div class="d-flex align-center mb-2">
+                      <v-chip 
+                        :color="sensor.color" 
+                        size="small" 
+                        class="mr-2"
+                      >
+                        ●
+                      </v-chip>
+                      <span class="text-body-2 font-weight-medium">{{ sensor.name }}</span>
+                    </div>
+                    <div class="text-h6">
+                      <span v-if="sensor.isConnected">
+                        {{ sensor.currentTemp.toFixed(1) }}°{{ appStore.tempUnit || 'C' }}
+                      </span>
+                      <span v-else class="text-error">
+                        Disconnected
+                      </span>
+                    </div>
+                    <div class="text-caption text-medium-emphasis">
+                      {{ sensor.timeSinceUpdate }}
+                    </div>
+                  </v-card>
+                </v-col>
+              </v-row>
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+      
       <v-row>
         <v-col cols="12" md="3">
           <v-text-field v-model="displayStatus" readonly :label="$t('control.status')" />

@@ -3,6 +3,7 @@
  * Copyright (C) Dekien Jeroen 2024
  */
 #include "brew-engine.h"
+#include "driver/spi_master.h"
 
 using namespace std;
 using json = nlohmann::json;
@@ -36,9 +37,9 @@ void BrewEngine::Init()
 
 	this->initHeaters();
 
-	if (!this->stir_PIN)
+	if (this->stir_PIN == GPIO_NUM_NC || this->stir_PIN >= GPIO_NUM_MAX)
 	{
-		ESP_LOGW(TAG, "StirPin is not configured!");
+		ESP_LOGW(TAG, "StirPin is not configured or invalid (pin: %d)!", this->stir_PIN);
 
 		this->stirStatusText = "Disabled";
 	}
@@ -49,9 +50,9 @@ void BrewEngine::Init()
 		gpio_set_level(this->stir_PIN, this->gpioLow);
 	}
 
-	if (!this->buzzer_PIN)
+	if (this->buzzer_PIN == GPIO_NUM_NC || this->buzzer_PIN >= GPIO_NUM_MAX)
 	{
-		ESP_LOGW(TAG, "Buzzer is not configured!");
+		ESP_LOGW(TAG, "Buzzer is not configured or invalid (pin: %d)!", this->buzzer_PIN);
 	}
 	else
 	{
@@ -68,6 +69,10 @@ void BrewEngine::Init()
 	this->initOneWire();
 
 	this->detectOnewireTemperatureSensors();
+
+	this->initRtdSensors();
+
+	this->detectRtdTemperatureSensors();
 
 	this->initMqtt();
 
@@ -101,6 +106,14 @@ void BrewEngine::readSystemSettings()
 	this->stir_PIN = (gpio_num_t)this->settingsManager->Read("stirPin", (uint16_t)CONFIG_STIR);
 	this->buzzer_PIN = (gpio_num_t)this->settingsManager->Read("buzzerPin", (uint16_t)CONFIG_BUZZER);
 	this->buzzerTime = this->settingsManager->Read("buzzerTime", (uint8_t)2);
+
+	// RTD sensor settings - use shorter keys to avoid NVS limits
+	this->rtdSensorsEnabled = this->settingsManager->Read("rtdEnabled", false);
+	this->spi_mosi_pin = (gpio_num_t)this->settingsManager->Read("spiMosi", (uint16_t)23);
+	this->spi_miso_pin = (gpio_num_t)this->settingsManager->Read("spiMiso", (uint16_t)19);
+	this->spi_clk_pin = (gpio_num_t)this->settingsManager->Read("spiClk", (uint16_t)18);
+	this->spi_cs_pin = (gpio_num_t)this->settingsManager->Read("spiCs", (uint16_t)5);
+	this->rtdSensorCount = 0;
 
 	bool configInvertOutputs = false;
 // is there a cleaner way to do this?, config to bool doesn't seem to work properly
@@ -162,6 +175,33 @@ void BrewEngine::saveSystemSettingsJson(const json &config)
 		uint8_t scale = (uint8_t)config["temperatureScale"];
 		this->settingsManager->Write("tempScale", scale); // key is limited to x chars so we shorten it
 		this->temperatureScale = (TemperatureScale)config["temperatureScale"];
+	}
+
+	// RTD sensor configuration - use shorter keys to avoid NVS limits
+	if (!config["rtdSensorsEnabled"].is_null() && config["rtdSensorsEnabled"].is_boolean())
+	{
+		this->settingsManager->Write("rtdEnabled", (bool)config["rtdSensorsEnabled"]);
+		this->rtdSensorsEnabled = (bool)config["rtdSensorsEnabled"];
+	}
+	if (!config["spiMosiPin"].is_null() && config["spiMosiPin"].is_number())
+	{
+		this->settingsManager->Write("spiMosi", (uint16_t)config["spiMosiPin"]);
+		this->spi_mosi_pin = (gpio_num_t)config["spiMosiPin"];
+	}
+	if (!config["spiMisoPin"].is_null() && config["spiMisoPin"].is_number())
+	{
+		this->settingsManager->Write("spiMiso", (uint16_t)config["spiMisoPin"]);
+		this->spi_miso_pin = (gpio_num_t)config["spiMisoPin"];
+	}
+	if (!config["spiClkPin"].is_null() && config["spiClkPin"].is_number())
+	{
+		this->settingsManager->Write("spiClk", (uint16_t)config["spiClkPin"]);
+		this->spi_clk_pin = (gpio_num_t)config["spiClkPin"];
+	}
+	if (!config["spiCsPin"].is_null() && config["spiCsPin"].is_number())
+	{
+		this->settingsManager->Write("spiCs", (uint16_t)config["spiCsPin"]);
+		this->spi_cs_pin = (gpio_num_t)config["spiCsPin"];
 	}
 
 	ESP_LOGI(TAG, "Saving System Settings Done");
@@ -684,6 +724,31 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 	// erase in second loop, we can't mutate wile in auto loop (c++ limitation atm)
 	for (auto &sensorId : sensorsToDelete)
 	{
+		// Clean up RTD hardware handles if this is an RTD sensor
+		auto sensorIt = this->sensors.find(sensorId);
+		if (sensorIt != this->sensors.end())
+		{
+			TemperatureSensor *sensor = sensorIt->second;
+			if (sensor->sensorType == SENSOR_PT100 || sensor->sensorType == SENSOR_PT1000)
+			{
+				// Find and remove the corresponding RTD hardware handle
+				for (auto rtdIt = this->rtdSensors.begin(); rtdIt != this->rtdSensors.end(); ++rtdIt)
+				{
+					if (*rtdIt != nullptr && memcmp(&(sensor->max31865Handle), *rtdIt, sizeof(max31865_t)) == 0)
+					{
+						// Remove device from SPI bus
+						if ((*rtdIt)->spi != nullptr)
+						{
+							spi_bus_remove_device((*rtdIt)->spi);
+						}
+						delete *rtdIt;
+						this->rtdSensors.erase(rtdIt);
+						this->rtdSensorCount--;
+						break;
+					}
+				}
+			}
+		}
 		this->sensors.erase(sensorId);
 	}
 
@@ -818,7 +883,8 @@ void BrewEngine::detectOnewireTemperatureSensors()
 					sensor->connected = true;
 					sensor->compensateAbsolute = 0;
 					sensor->compensateRelative = 1;
-					sensor->handle = newHandle;
+					sensor->sensorType = SENSOR_DS18B20;
+					sensor->ds18b20Handle = newHandle;
 					this->sensors.insert_or_assign(sensor->id, sensor);
 				}
 				else
@@ -826,7 +892,7 @@ void BrewEngine::detectOnewireTemperatureSensors()
 					ESP_LOGI(TAG, "Existing Sensor");
 					// just set connected and handle
 					TemperatureSensor *sensor = it->second;
-					sensor->handle = newHandle;
+					sensor->ds18b20Handle = newHandle;
 					sensor->connected = true;
 				}
 
@@ -844,6 +910,284 @@ void BrewEngine::detectOnewireTemperatureSensors()
 	ESP_LOGI(TAG, "Searching done, %d DS18B20 device(s) found", this->sensors.size());
 
 	this->skipTempLoop = false;
+}
+
+void BrewEngine::initRtdSensors()
+{
+	ESP_LOGI(TAG, "initRtdSensors: Start");
+
+	if (!this->rtdSensorsEnabled)
+	{
+		ESP_LOGI(TAG, "RTD sensors disabled in configuration");
+		return;
+	}
+
+	// Validate SPI pin configuration
+	if (this->spi_mosi_pin == GPIO_NUM_NC || this->spi_mosi_pin >= GPIO_NUM_MAX ||
+		this->spi_miso_pin == GPIO_NUM_NC || this->spi_miso_pin >= GPIO_NUM_MAX ||
+		this->spi_clk_pin == GPIO_NUM_NC || this->spi_clk_pin >= GPIO_NUM_MAX)
+	{
+		ESP_LOGE(TAG, "Invalid SPI pin configuration for RTD sensors (MOSI:%d, MISO:%d, CLK:%d)", 
+				 this->spi_mosi_pin, this->spi_miso_pin, this->spi_clk_pin);
+		return;
+	}
+
+	// Initialize SPI bus for RTD sensors (only once for all MAX31865 devices)
+	esp_err_t ret = max31865_init_bus(SPI2_HOST, (int)this->spi_mosi_pin, (int)this->spi_miso_pin, (int)this->spi_clk_pin);
+	if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+	{
+		ESP_LOGE(TAG, "Failed to initialize SPI bus for RTD sensors: %s", esp_err_to_name(ret));
+		return;
+	}
+
+	ESP_LOGI(TAG, "RTD SPI bus initialized successfully");
+	ESP_LOGI(TAG, "initRtdSensors: Done");
+}
+
+void BrewEngine::detectRtdTemperatureSensors()
+{
+	ESP_LOGI(TAG, "detectRtdTemperatureSensors: Start");
+
+	if (!this->rtdSensorsEnabled)
+	{
+		ESP_LOGI(TAG, "RTD sensors disabled, skipping detection");
+		return;
+	}
+
+	// Validate SPI pin configuration before attempting to use RTD sensors
+	if (this->spi_mosi_pin == GPIO_NUM_NC || this->spi_mosi_pin >= GPIO_NUM_MAX ||
+		this->spi_miso_pin == GPIO_NUM_NC || this->spi_miso_pin >= GPIO_NUM_MAX ||
+		this->spi_clk_pin == GPIO_NUM_NC || this->spi_clk_pin >= GPIO_NUM_MAX)
+	{
+		ESP_LOGE(TAG, "Invalid SPI pin configuration for RTD sensors (MOSI:%d, MISO:%d, CLK:%d)", 
+				 this->spi_mosi_pin, this->spi_miso_pin, this->spi_clk_pin);
+		
+		// Mark all RTD sensors as disconnected
+		for (auto &[sensorId, sensor] : this->sensors)
+		{
+			if (sensor->sensorType == SENSOR_PT100 || sensor->sensorType == SENSOR_PT1000)
+			{
+				sensor->connected = false;
+			}
+		}
+		return;
+	}
+
+	// we need to temp stop our temp read loop while we change the sensor data
+	this->skipTempLoop = true;
+	vTaskDelay(pdMS_TO_TICKS(2000));
+
+	// Clean up any existing RTD hardware handles before re-initializing
+	this->cleanupRtdSensors();
+
+	// Re-initialize SPI bus to ensure it's properly configured
+	esp_err_t bus_ret = max31865_init_bus(SPI2_HOST, (int)this->spi_mosi_pin, (int)this->spi_miso_pin, (int)this->spi_clk_pin);
+	if (bus_ret != ESP_OK && bus_ret != ESP_ERR_INVALID_STATE)
+	{
+		ESP_LOGE(TAG, "Failed to initialize SPI bus for RTD sensors: %s", esp_err_to_name(bus_ret));
+		
+		// Mark all RTD sensors as disconnected
+		for (auto &[sensorId, sensor] : this->sensors)
+		{
+			if (sensor->sensorType == SENSOR_PT100 || sensor->sensorType == SENSOR_PT1000)
+			{
+				sensor->connected = false;
+			}
+		}
+		
+		this->skipTempLoop = false;
+		return;
+	}
+
+	// Initialize hardware handles for all RTD sensors loaded from NVS
+	int rtdSensorsInitialized = 0;
+	
+	for (auto &[sensorId, sensor] : this->sensors)
+	{
+		// Skip non-RTD sensors
+		if (sensor->sensorType != SENSOR_PT100 && sensor->sensorType != SENSOR_PT1000)
+		{
+			continue;
+		}
+
+		ESP_LOGI(TAG, "Initializing RTD sensor: %s (ID: %llu)", sensor->name.c_str(), sensorId);
+		
+		// Extract CS pin from sensor ID (format: 0x31865000 + CS pin)
+		int csPin = (int)(sensorId - 0x31865000);
+		ESP_LOGI(TAG, "Extracted CS pin %d from sensor ID %llu (0x%llx)", csPin, sensorId, sensorId);
+		
+		// Validate CS pin
+		if (csPin < 0 || csPin >= GPIO_NUM_MAX)
+		{
+			ESP_LOGE(TAG, "Invalid CS pin %d for RTD sensor %s", csPin, sensor->name.c_str());
+			sensor->connected = false;
+			continue;
+		}
+
+		// Initialize MAX31865 device (SPI bus should already be initialized)
+		max31865_t *rtd_sensor = new max31865_t;
+		esp_err_t ret = max31865_init_desc(rtd_sensor, SPI2_HOST, csPin);
+		
+		if (ret == ESP_OK)
+		{
+			// Configure MAX31865 based on sensor type
+			ret = max31865_set_config(rtd_sensor, true, 1, false, false, 0, true, true, 0, 0xFFFF);
+			
+			if (ret == ESP_OK)
+			{
+				// Set RTD parameters based on sensor type
+				if (sensor->sensorType == SENSOR_PT100)
+				{
+					rtd_sensor->rtd_nominal = 100;   // PT100
+					rtd_sensor->ref_resistor = 430;  // Reference resistor for PT100
+				}
+				else if (sensor->sensorType == SENSOR_PT1000)
+				{
+					rtd_sensor->rtd_nominal = 1000;  // PT1000
+					rtd_sensor->ref_resistor = 4300; // Reference resistor for PT1000
+				}
+				
+				// Store hardware handle in sensor object
+				sensor->max31865Handle = *rtd_sensor;
+				sensor->consecutiveFailures = 0; // Initialize failure counter
+				sensor->connected = true;
+				
+				// Add to RTD sensor list
+				this->rtdSensors.push_back(rtd_sensor);
+				rtdSensorsInitialized++;
+				
+				ESP_LOGI(TAG, "RTD sensor %s initialized successfully on CS pin %d", sensor->name.c_str(), csPin);
+			}
+			else
+			{
+				ESP_LOGE(TAG, "Failed to configure RTD sensor %s: %s", sensor->name.c_str(), esp_err_to_name(ret));
+				delete rtd_sensor;
+				sensor->connected = false;
+			}
+		}
+		else
+		{
+			ESP_LOGE(TAG, "Failed to initialize RTD sensor %s on CS pin %d: %s", sensor->name.c_str(), csPin, esp_err_to_name(ret));
+			delete rtd_sensor;
+			sensor->connected = false;
+		}
+	}
+
+	this->rtdSensorCount = rtdSensorsInitialized;
+	ESP_LOGI(TAG, "RTD detection done, %d RTD sensor(s) initialized", this->rtdSensorCount);
+	this->skipTempLoop = false;
+}
+
+void BrewEngine::cleanupRtdSensors()
+{
+	ESP_LOGI(TAG, "Cleaning up RTD sensors");
+	
+	// Clean up MAX31865 hardware handles
+	for (auto rtd_sensor : this->rtdSensors)
+	{
+		if (rtd_sensor != nullptr)
+		{
+			// Remove device from SPI bus
+			if (rtd_sensor->spi != nullptr)
+			{
+				spi_bus_remove_device(rtd_sensor->spi);
+			}
+			delete rtd_sensor;
+		}
+	}
+	
+	// Clear the RTD sensor list
+	this->rtdSensors.clear();
+	this->rtdSensorCount = 0;
+	
+	ESP_LOGI(TAG, "RTD sensor cleanup completed");
+}
+
+bool BrewEngine::reinitializeRtdSensor(TemperatureSensor *sensor)
+{
+	if (sensor->sensorType != SENSOR_PT100 && sensor->sensorType != SENSOR_PT1000)
+	{
+		return false;
+	}
+
+	// Extract CS pin from sensor ID
+	int csPin = (int)(sensor->id - 0x31865000);
+	
+	// Validate CS pin
+	if (csPin < 0 || csPin >= GPIO_NUM_MAX)
+	{
+		ESP_LOGE(TAG, "Invalid CS pin %d for RTD sensor %s", csPin, sensor->name.c_str());
+		return false;
+	}
+
+	ESP_LOGI(TAG, "Reinitializing RTD sensor %s on CS pin %d", sensor->name.c_str(), csPin);
+
+	// Clean up the old hardware handle if it exists
+	if (sensor->max31865Handle.spi != nullptr)
+	{
+		// Find and remove the old RTD sensor from the list
+		for (auto it = this->rtdSensors.begin(); it != this->rtdSensors.end(); ++it)
+		{
+			if ((*it)->spi == sensor->max31865Handle.spi)
+			{
+				// Remove device from SPI bus
+				spi_bus_remove_device((*it)->spi);
+				delete *it;
+				this->rtdSensors.erase(it);
+				this->rtdSensorCount--;
+				break;
+			}
+		}
+	}
+
+	// Try to re-initialize the MAX31865 device
+	max31865_t *rtd_sensor = new max31865_t;
+	esp_err_t ret = max31865_init_desc(rtd_sensor, SPI2_HOST, csPin);
+	
+	if (ret == ESP_OK)
+	{
+		// Configure MAX31865 based on sensor type
+		ret = max31865_set_config(rtd_sensor, true, 1, false, false, 0, true, true, 0, 0xFFFF);
+		
+		if (ret == ESP_OK)
+		{
+			// Set RTD parameters based on sensor type
+			if (sensor->sensorType == SENSOR_PT100)
+			{
+				rtd_sensor->rtd_nominal = 100;   // PT100
+				rtd_sensor->ref_resistor = 430;  // Reference resistor for PT100
+			}
+			else if (sensor->sensorType == SENSOR_PT1000)
+			{
+				rtd_sensor->rtd_nominal = 1000;  // PT1000
+				rtd_sensor->ref_resistor = 4300; // Reference resistor for PT1000
+			}
+			
+			// Update sensor with new hardware handle
+			sensor->max31865Handle = *rtd_sensor;
+			sensor->consecutiveFailures = 0; // Reset failure counter
+			sensor->connected = false; // Will be set to true on successful read
+			
+			// Add to RTD sensor list
+			this->rtdSensors.push_back(rtd_sensor);
+			this->rtdSensorCount++;
+			
+			ESP_LOGI(TAG, "RTD sensor %s re-initialized successfully on CS pin %d", sensor->name.c_str(), csPin);
+			return true;
+		}
+		else
+		{
+			ESP_LOGE(TAG, "Failed to configure re-initialized RTD sensor %s: %s", sensor->name.c_str(), esp_err_to_name(ret));
+			delete rtd_sensor;
+		}
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Failed to re-initialize RTD sensor %s on CS pin %d: %s", sensor->name.c_str(), csPin, esp_err_to_name(ret));
+		delete rtd_sensor;
+	}
+	
+	return false;
 }
 
 void BrewEngine::start()
@@ -1266,36 +1610,164 @@ void BrewEngine::readLoop(void *arg)
 		for (auto &[key, sensor] : instance->sensors)
 		{
 			float temperature;
-			ds18b20_device_handle_t handle = sensor->handle;
 			string stringId = std::to_string(key);
 
-			// not useForControl or connected, continue
-			if (!sensor->handle || !sensor->connected)
+			// Skip disconnected sensors, except for RTD sensors which we want to retry
+			if (!sensor->connected && sensor->sensorType != SENSOR_PT100 && sensor->sensorType != SENSOR_PT1000)
 			{
 				continue;
 			}
 
-			esp_err_t err = ds18b20_trigger_temperature_conversion(handle);
+			esp_err_t err = ESP_OK;
 
-			if (err != ESP_OK)
+			// Read temperature based on sensor type
+			if (sensor->sensorType == SENSOR_DS18B20)
 			{
-				ESP_LOGW(TAG, "Error Reading from [%s], disabling sensor!", stringId.c_str());
-				sensor->connected = false;
-				sensor->lastTemp = 0;
-				instance->currentTemperatures.erase(key);
-				continue;
-			};
+				// DS18B20 reading
+				if (!sensor->ds18b20Handle)
+				{
+					continue;
+				}
 
-			err = ds18b20_get_temperature(handle, &temperature);
+				err = ds18b20_trigger_temperature_conversion(sensor->ds18b20Handle);
+				if (err != ESP_OK)
+				{
+					ESP_LOGW(TAG, "Error triggering conversion for DS18B20 [%s], disabling sensor!", stringId.c_str());
+					sensor->connected = false;
+					sensor->lastTemp = 0;
+					instance->currentTemperatures.erase(key);
+					continue;
+				}
 
-			if (err != ESP_OK)
+				err = ds18b20_get_temperature(sensor->ds18b20Handle, &temperature);
+				if (err != ESP_OK)
+				{
+					ESP_LOGW(TAG, "Error reading temperature from DS18B20 [%s], disabling sensor!", stringId.c_str());
+					sensor->connected = false;
+					sensor->lastTemp = 0;
+					instance->currentTemperatures.erase(key);
+					continue;
+				}
+			}
+			else if (sensor->sensorType == SENSOR_PT100 || sensor->sensorType == SENSOR_PT1000)
 			{
-				ESP_LOGW(TAG, "Error Reading from [%s], disabling sensor!", stringId.c_str());
-				sensor->connected = false;
-				sensor->lastTemp = 0;
-				instance->currentTemperatures.erase(key);
+				// RTD reading - always attempt to read, even if previously disconnected
+				// But first check if the SPI handle is valid
+				if (sensor->max31865Handle.spi == nullptr)
+				{
+					// Invalid SPI handle, mark as disconnected and skip
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					sensor->consecutiveFailures++;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					
+					// Try to reinitialize after 3 consecutive failures for invalid handles
+					if (sensor->consecutiveFailures >= 3)
+					{
+						ESP_LOGI(TAG, "Attempting to reinitialize RTD sensor %s (invalid handle)", sensor->name.c_str());
+						if (instance->reinitializeRtdSensor(sensor))
+						{
+							sensor->consecutiveFailures = 0;
+							ESP_LOGI(TAG, "RTD sensor %s reinitialized successfully", sensor->name.c_str());
+						}
+						else
+						{
+							sensor->consecutiveFailures = 0; // Reset counter to avoid spam
+						}
+					}
+					continue;
+				}
+				
+				float rtd_resistance;
+				err = max31865_measure(&sensor->max31865Handle, &rtd_resistance, &temperature);
+				if (err != ESP_OK)
+				{
+					// Track consecutive failures for retry logic
+					sensor->consecutiveFailures++;
+					
+					if (err == ESP_ERR_NOT_FOUND)
+					{
+						// Probe disconnected - show disconnected status but keep trying
+						if (sensor->connected)
+						{
+							ESP_LOGW(TAG, "RTD probe [%s] disconnected", stringId.c_str());
+						}
+						sensor->lastTemp = -999.0; // Invalid temperature to show disconnected
+						sensor->connected = false;  // Mark as disconnected
+						if (sensor->show)
+						{
+							instance->currentTemperatures.insert_or_assign(key, -999.0);
+						}
+						
+						// Try to reinitialize after 5 consecutive failures (5 seconds)
+						if (sensor->consecutiveFailures >= 5)
+						{
+							ESP_LOGI(TAG, "Attempting to reinitialize RTD sensor %s after %d failures", sensor->name.c_str(), sensor->consecutiveFailures);
+							if (instance->reinitializeRtdSensor(sensor))
+							{
+								sensor->consecutiveFailures = 0;
+								ESP_LOGI(TAG, "RTD sensor %s reinitialized successfully", sensor->name.c_str());
+							}
+							else
+							{
+								sensor->consecutiveFailures = 0; // Reset counter to avoid spam
+							}
+						}
+						
+						continue; // Skip this sensor for control calculations
+					}
+					else
+					{
+						// Other errors - keep trying but mark as disconnected
+						if (sensor->connected)
+						{
+							ESP_LOGW(TAG, "Error reading temperature from RTD [%s]: %s", stringId.c_str(), esp_err_to_name(err));
+						}
+						sensor->lastTemp = -999.0; // Invalid temperature
+						sensor->connected = false;  // Mark as disconnected
+						if (sensor->show)
+						{
+							instance->currentTemperatures.insert_or_assign(key, -999.0);
+						}
+						
+						// Try to reinitialize after 5 consecutive failures for other errors
+						if (sensor->consecutiveFailures >= 5)
+						{
+							ESP_LOGI(TAG, "Attempting to reinitialize RTD sensor %s after %d failures", sensor->name.c_str(), sensor->consecutiveFailures);
+							if (instance->reinitializeRtdSensor(sensor))
+							{
+								sensor->consecutiveFailures = 0;
+								ESP_LOGI(TAG, "RTD sensor %s reinitialized successfully", sensor->name.c_str());
+							}
+							else
+							{
+								sensor->consecutiveFailures = 0; // Reset counter to avoid spam
+							}
+						}
+						
+						continue; // Skip this sensor for control calculations
+					}
+				}
+				else
+				{
+					// Successful reading - mark sensor as connected (recovery case)
+					if (!sensor->connected)
+					{
+						ESP_LOGI(TAG, "RTD probe [%s] reconnected", stringId.c_str());
+						sensor->connected = true;
+					}
+					// Reset failure counter on successful read
+					sensor->consecutiveFailures = 0;
+				}
+			}
+			else
+			{
+				ESP_LOGW(TAG, "Unknown sensor type for [%s], skipping", stringId.c_str());
 				continue;
-			};
+			}
 
 			// conversion needed
 			if (instance->temperatureScale == Fahrenheit)
@@ -2081,6 +2553,105 @@ string BrewEngine::processCommand(const string &payLoad)
 	{
 		this->detectOnewireTemperatureSensors();
 	}
+	else if (command == "AddRtdSensor")
+	{
+		if (!this->rtdSensorsEnabled)
+		{
+			success = false;
+			message = "RTD sensors are not enabled in system settings";
+		}
+		else
+		{
+			string name = data["name"];
+			int csPin = data["csPin"];
+			int sensorType = data["sensorType"];
+			bool useForControl = data["useForControl"];
+			bool show = data["show"];
+			
+			// Generate unique ID for RTD sensor
+			uint64_t rtdSensorId = 0x31865000 + csPin; // Base ID + CS pin
+			
+			// Check if sensor already exists
+			if (this->sensors.find(rtdSensorId) != this->sensors.end())
+			{
+				success = false;
+				message = "RTD sensor with CS pin " + to_string(csPin) + " already exists";
+			}
+			else
+			{
+				// Validate GPIO pin
+				if (csPin < 0 || csPin >= GPIO_NUM_MAX)
+				{
+					success = false;
+					message = "Invalid CS pin number: " + to_string(csPin);
+				}
+				else
+				{
+					// Initialize MAX31865 device (SPI bus should already be initialized)
+					max31865_t *rtd_sensor = new max31865_t;
+					esp_err_t ret = max31865_init_desc(rtd_sensor, SPI2_HOST, csPin);
+					
+					if (ret == ESP_OK)
+					{
+						// Configure MAX31865
+						ret = max31865_set_config(rtd_sensor, true, 1, false, false, 0, true, true, 0, 0xFFFF);
+					}
+					
+					if (ret == ESP_OK)
+					{
+						// Set RTD parameters based on sensor type
+						if (sensorType == SENSOR_PT100)
+						{
+							rtd_sensor->rtd_nominal = 100;
+							rtd_sensor->ref_resistor = 430;
+						}
+						else if (sensorType == SENSOR_PT1000)
+						{
+							rtd_sensor->rtd_nominal = 1000;
+							rtd_sensor->ref_resistor = 4300;
+						}
+						
+						// Create temperature sensor object
+						auto sensor = new TemperatureSensor();
+						sensor->id = rtdSensorId;
+						sensor->name = name;
+						sensor->color = (sensorType == SENSOR_PT100) ? "#00C853" : "#FF9800"; // Green for PT100, Orange for PT1000
+						sensor->useForControl = useForControl;
+						sensor->show = show;
+						sensor->connected = true;
+						sensor->compensateAbsolute = 0;
+						sensor->compensateRelative = 1;
+						sensor->sensorType = (SensorType)sensorType;
+						sensor->max31865Handle = *rtd_sensor;
+						sensor->consecutiveFailures = 0; // Initialize failure counter
+						
+						this->sensors.insert_or_assign(sensor->id, sensor);
+						this->rtdSensors.push_back(rtd_sensor);
+						this->rtdSensorCount++;
+						
+						// Save sensor settings
+						json jSensors = json::array({});
+						for (auto const &[key, val] : this->sensors)
+						{
+							json jSensor = val->to_json();
+							jSensors.push_back(jSensor);
+						}
+						this->saveTempSensorSettings(jSensors);
+						
+						ESP_LOGI(TAG, "RTD sensor added successfully: %s (CS pin %d)", name.c_str(), csPin);
+						message = "RTD sensor added successfully";
+					}
+					else
+					{
+						delete rtd_sensor;
+						success = false;
+						message = "Failed to initialize MAX31865: " + string(esp_err_to_name(ret));
+						ESP_LOGE(TAG, "Failed to initialize RTD sensor: %s", esp_err_to_name(ret));
+					}
+				}
+			}
+		}
+	}
 	else if (command == "GetHeaterSettings")
 	{
 		// Convert heaters to json
@@ -2141,6 +2712,11 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"invertOutputs", this->invertOutputs},
 			{"mqttUri", this->mqttUri},
 			{"temperatureScale", this->temperatureScale},
+			{"rtdSensorsEnabled", this->rtdSensorsEnabled},
+			{"spiMosiPin", this->spi_mosi_pin},
+			{"spiMisoPin", this->spi_miso_pin},
+			{"spiClkPin", this->spi_clk_pin},
+			{"spiCsPin", this->spi_cs_pin},
 		};
 	}
 	else if (command == "SaveSystemSettings")

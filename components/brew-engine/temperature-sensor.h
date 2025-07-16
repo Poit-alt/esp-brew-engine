@@ -2,9 +2,18 @@
 #define _TemperatureSensor_H_
 
 #include "nlohmann_json.hpp"
+#include "ds18b20.h"
+#include "max31865_driver.h"
+#include <cstring>
 
 using namespace std;
 using json = nlohmann::json;
+
+enum SensorType {
+    SENSOR_DS18B20,
+    SENSOR_PT100,
+    SENSOR_PT1000
+};
 
 class TemperatureSensor
 {
@@ -18,7 +27,14 @@ public:
     float compensateAbsolute;
     float compensateRelative;
     float lastTemp;
-    ds18b20_device_handle_t handle;
+    SensorType sensorType;
+    
+    // Sensor-specific handles
+    ds18b20_device_handle_t ds18b20Handle;
+    max31865_t max31865Handle;
+    
+    // RTD sensor recovery tracking
+    int consecutiveFailures;
 
     json to_json()
     {
@@ -32,6 +48,7 @@ public:
         jSensor["compensateAbsolute"] = this->compensateAbsolute;
         jSensor["compensateRelative"] = this->compensateRelative;
         jSensor["lastTemp"] = (double)((int)(this->lastTemp * 10)) / 10; // round float to 0.1 for display
+        jSensor["sensorType"] = this->sensorType;
 
         return jSensor;
     };
@@ -81,8 +98,22 @@ public:
             this->compensateRelative = 1;
         }
 
+        if (jsonData.contains("sensorType") && !jsonData["sensorType"].is_null() && jsonData["sensorType"].is_number_integer())
+        {
+            this->sensorType = (SensorType)jsonData["sensorType"];
+        }
+        else
+        {
+            this->sensorType = SENSOR_DS18B20; // default to DS18B20 for backward compatibility
+        }
+
         // will be set by detection
         this->connected = false;
+        this->consecutiveFailures = 0;
+        
+        // Initialize hardware handles to safe defaults
+        this->ds18b20Handle = nullptr;
+        memset(&this->max31865Handle, 0, sizeof(this->max31865Handle));
     };
 
 protected:
