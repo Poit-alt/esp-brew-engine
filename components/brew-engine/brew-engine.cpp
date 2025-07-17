@@ -1201,6 +1201,9 @@ void BrewEngine::start()
 		this->overrideTargetTemperature = std::nullopt;
 		// clear old temp log
 		this->tempLog.clear();
+		
+		// clear old sensor temperature logs
+		this->sensorTempLogs.clear();
 
 		// also clear old steps
 		for (auto const &step : this->executionSteps)
@@ -1799,6 +1802,13 @@ void BrewEngine::readLoop(void *arg)
 			if (sensor->show)
 			{
 				instance->currentTemperatures.insert_or_assign(key, sensor->lastTemp);
+				
+				// Store individual sensor temperature for persistent logging during control run
+				if (instance->controlRun)
+				{
+					time_t current_raw_time = time(0);
+					instance->sensorTempLogs[key][current_raw_time] = sensor->lastTemp;
+				}
 			}
 		}
 
@@ -1811,37 +1821,20 @@ void BrewEngine::readLoop(void *arg)
 		// when controlrun is true we need to keep out data
 		if (instance->controlRun)
 		{
-			// we don't have that much ram so we log only every 5 cycles
-
+			time_t current_raw_time = time(0);
+			
+			// Store Control/Average temperature in the same system as individual sensors
+			// Use a special sensor ID for the average (0xFFFFFFFFFFFFFFFF)
+			uint64_t avgSensorId = 0xFFFFFFFFFFFFFFFF;
+			instance->sensorTempLogs[avgSensorId][current_raw_time] = avg;
+			
+			// Add statistics data point every 6 cycles to reduce overhead
 			it++;
 			if (it > 5)
 			{
 				it = 0;
-				int lastTemp = 0;
-
-				if (!instance->tempLog.empty())
-				{
-					auto lastValue = instance->tempLog.rbegin();
-					lastTemp = lastValue->second;
-				}
-
-				if (lastTemp != (int)avg)
-				{
-					// decided agains chrono just make it a hell lot more complex
-					// instance->tempLog.insert(std::make_pair(std::chrono::system_clock::now(), (int)avg));
-					time_t current_raw_time = time(0);
-					// System time: number of seconds since 00:00,
-					instance->tempLog.insert(std::make_pair(current_raw_time, (int)avg));
-
-					ESP_LOGI(TAG, "Logging: %d°", (int)avg);
-					
-					// Add statistics data point
-					instance->statisticsManager->AddDataPoint(current_raw_time, (int8_t)avg, (int8_t)instance->targetTemperature, instance->pidOutput);
-				}
-				else
-				{
-					ESP_LOGI(TAG, "Skip same");
-				}
+				instance->statisticsManager->AddDataPoint(current_raw_time, (int8_t)avg, (int8_t)instance->targetTemperature, instance->pidOutput);
+				ESP_LOGD(TAG, "Logging: %.1f°", avg);
 			}
 
 			if (instance->mqttEnabled)
@@ -2311,7 +2304,18 @@ string BrewEngine::processCommand(const string &payLoad)
 					{
 						json jTempLogItem;
 						jTempLogItem["time"] = iter->first;
-						jTempLogItem["temp"] = iter->second;
+						// Handle both old format (integers) and new format (tenths)
+						// New format values are typically > 100 (e.g., 270 for 27.0°C)
+						// Old format values are typically < 100 (e.g., 27 for 27°C)
+						double tempValue;
+						if (iter->second > 100 || iter->second < 0) {
+							// New format: stored as tenths of degrees
+							tempValue = (double)(iter->second) / 10.0;
+						} else {
+							// Old format: stored as whole degrees
+							tempValue = (double)(iter->second);
+						}
+						jTempLogItem["temp"] = tempValue;
 						jTempLog.push_back(jTempLogItem);
 					}
 					else
@@ -2326,7 +2330,18 @@ string BrewEngine::processCommand(const string &payLoad)
 				{
 					json jTempLogItem;
 					jTempLogItem["time"] = iter->first;
-					jTempLogItem["temp"] = iter->second;
+					// Handle both old format (integers) and new format (tenths)
+					// New format values are typically > 100 (e.g., 270 for 27.0°C)
+					// Old format values are typically < 100 (e.g., 27 for 27°C)
+					double tempValue;
+					if (iter->second > 100 || iter->second < 0) {
+						// New format: stored as tenths of degrees
+						tempValue = (double)(iter->second) / 10.0;
+					} else {
+						// Old format: stored as whole degrees
+						tempValue = (double)(iter->second);
+					}
+					jTempLogItem["temp"] = tempValue;
 					jTempLog.push_back(jTempLogItem);
 				}
 			}
@@ -2342,6 +2357,52 @@ string BrewEngine::processCommand(const string &payLoad)
 			jCurrentTemps.push_back(jCurrentTemp);
 		}
 
+		// Individual sensor temperature logs for persistent storage (including Control/Average)
+		json jSensorTempLogs = json::array({});
+		for (auto const &[sensorId, sensorLog] : this->sensorTempLogs)
+		{
+			json jSensorTempLog;
+			jSensorTempLog["sensor"] = to_string(sensorId);
+			
+			json jTemps = json::array({});
+			
+			// If we have a last date we only need to send the log increment
+			if (!data["lastDate"].is_null() && data["lastDate"].is_number())
+			{
+				time_t lastClientDate = (time_t)data["lastDate"];
+				
+				// Send only new temperature readings since last client date
+				for (auto iter = sensorLog.rbegin(); iter != sensorLog.rend(); ++iter)
+				{
+					if (iter->first > lastClientDate)
+					{
+						json jTempItem;
+						jTempItem["time"] = iter->first;
+						jTempItem["temp"] = (double)((int)(iter->second * 10)) / 10; // round to 1 digit
+						jTemps.push_back(jTempItem);
+					}
+					else
+					{
+						break;
+					}
+				}
+			}
+			else
+			{
+				// Send all temperature readings for this sensor
+				for (auto iter = sensorLog.rbegin(); iter != sensorLog.rend(); ++iter)
+				{
+					json jTempItem;
+					jTempItem["time"] = iter->first;
+					jTempItem["temp"] = (double)((int)(iter->second * 10)) / 10; // round to 1 digit
+					jTemps.push_back(jTempItem);
+				}
+			}
+			
+			jSensorTempLog["temps"] = jTemps;
+			jSensorTempLogs.push_back(jSensorTempLog);
+		}
+
 		resultData = {
 			{"temp", (double)((int)(this->temperature * 10)) / 10}, // round float to 1 digit for display
 			{"temps", jCurrentTemps},
@@ -2352,7 +2413,8 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"status", this->statusText},
 			{"stirStatus", this->stirStatusText},
 			{"lastLogDateTime", lastLogDateTime},
-			{"tempLog", jTempLog},
+			{"tempLog", json::array({})}, // Empty array for backward compatibility
+			{"sensorTempLogs", jSensorTempLogs},
 			{"runningVersion", this->runningVersion},
 			{"inOverTime", this->inOverTime},
 			{"boostStatus", this->boostStatus},

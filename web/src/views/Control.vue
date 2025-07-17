@@ -256,17 +256,32 @@ const chartData = computed(() => {
     }
   }
 
-  const realData = rawData.value.map((item) => ({
-    x: item.time * 1000,
-    y: item.temp,
-  }));
+  // Find Control/Average data from sensorTempLogs (special sensor ID: 18446744073709551615)
+  const avgSensorId = "18446744073709551615"; // 0xFFFFFFFFFFFFFFFF as string
+  const avgSensorData = currentTemps.value.find((ct) => ct.sensor === avgSensorId);
+  
+  let realData: Array<{x: number, y: number}> = [];
+  if (avgSensorData && avgSensorData.temps) {
+    realData = avgSensorData.temps
+      .filter((temp) => temp.temp !== -999) // Filter out invalid readings
+      .map((temp) => ({
+        x: temp.time * 1000,
+        y: temp.temp,
+      }));
+  }
 
   // also add the current value, out controller doesn't send identical temp point for performance reasons
-  if (lastGoodDataDate.value != null && temperature.value != null) {
-    realData.push({
-      x: Date.now(),
-      y: temperature.value,
-    });
+  if (lastGoodDataDate.value != null && temperature.value != null && realData.length > 0) {
+    const lastDataTime = realData[realData.length - 1]?.x || 0;
+    const currentTime = Date.now();
+    
+    // Only add current value if more than 1 second has passed since last data point
+    if (currentTime - lastDataTime > 1000) {
+      realData.push({
+        x: currentTime,
+        y: temperature.value,
+      });
+    }
   }
 
   let datasets = [
@@ -276,6 +291,7 @@ const chartData = computed(() => {
       borderColor: "rgba(255, 255, 255, 0.9)",
       lineTension: 0,
       fill: false,
+      pointRadius: 0,
       xAxisID: "xAxis",
       yAxisID: "yAxis",
       data: realData,
@@ -292,39 +308,41 @@ const chartData = computed(() => {
     },
   ];
 
-  const extraDataSets = currentTemps.value.map((extraSet) => {
-    // Filter out disconnected sensor readings (temp === -999)
-    const setData = extraSet.temps
-      .filter((temp) => temp.temp !== -999)
-      .map((temp) => ({
-        x: temp.time * 1000,
-        y: temp.temp,
-      }));
+  const extraDataSets = currentTemps.value
+    .filter((extraSet) => extraSet.sensor !== avgSensorId) // Exclude Control/Average sensor
+    .map((extraSet) => {
+      // Filter out disconnected sensor readings (temp === -999)
+      const setData = extraSet.temps
+        .filter((temp) => temp.temp !== -999)
+        .map((temp) => ({
+          x: temp.time * 1000,
+          y: temp.temp,
+        }));
 
-    let label = extraSet.sensor;
-    let { color } = extraSet;
-    const sensor = tempSensors.value.find((s) => s.id === extraSet.sensor);
+      let label = extraSet.sensor;
+      let { color } = extraSet;
+      const sensor = tempSensors.value.find((s) => s.id === extraSet.sensor);
 
-    if (sensor !== undefined) {
-      label = sensor.name;
-      color = sensor.color;
-    }
+      if (sensor !== undefined) {
+        label = sensor.name;
+        color = sensor.color;
+      }
 
-    const dataset = {
-      label,
-      backgroundColor: color,
-      borderColor: color,
-      lineWidth: 0.2,
-      lineTension: 0,
-      xAxisID: "xAxis",
-      yAxisID: "yAxis",
-      fill: false,
-      pointRadius: 0,
-      data: setData,
-    };
+      const dataset = {
+        label,
+        backgroundColor: color,
+        borderColor: color,
+        lineWidth: 0.2,
+        lineTension: 0,
+        xAxisID: "xAxis",
+        yAxisID: "yAxis",
+        fill: false,
+        pointRadius: 0,
+        data: setData,
+      };
 
-    return dataset;
-  }).filter(dataset => dataset.data.length > 0); // Remove datasets with no valid data points
+      return dataset;
+    }).filter(dataset => dataset.data.length > 0); // Remove datasets with no valid data points
 
   datasets = [...datasets, ...extraDataSets];
 
@@ -488,10 +506,47 @@ const getData = async () => {
 
   rawData.value = tempData;
 
-  // if there are more then 1 sensor we also get the raw data per sensor (whitout history)
-  const timestampSeconds = Math.floor(Date.now() / 1000);
-
-  if (apiResult.data.temps !== null) {
+  // Handle individual sensor temperature logs with persistent storage
+  if (apiResult.data.sensorTempLogs !== null && apiResult.data.sensorTempLogs.length > 0) {
+    apiResult.data.sensorTempLogs.forEach((sensorLog: any) => {
+      // Find existing record for this sensor
+      const foundRecord = currentTemps.value.find((ct: any) => ct.sensor === sensorLog.sensor);
+      
+      if (foundRecord === undefined) {
+        // Create new record with all historical data
+        const newRecord: ITempLog = {
+          sensor: sensorLog.sensor,
+          color: dynamicColor(),
+          temps: sensorLog.temps.map((temp: any) => ({
+            time: temp.time,
+            temp: temp.temp,
+          })),
+        };
+        currentTemps.value.push(newRecord);
+      } else {
+        // Merge new temperature data with existing data
+        const existingTemps = foundRecord.temps || [];
+        const newTemps = sensorLog.temps.map((temp: any) => ({
+          time: temp.time,
+          temp: temp.temp,
+        }));
+        
+        // Combine and sort by time to ensure proper ordering
+        const combinedTemps = [...existingTemps, ...newTemps];
+        combinedTemps.sort((a, b) => a.time - b.time);
+        
+        // Remove duplicates based on time
+        const uniqueTemps = combinedTemps.filter((temp, index, arr) => 
+          index === 0 || temp.time !== arr[index - 1].time
+        );
+        
+        foundRecord.temps = uniqueTemps;
+      }
+    });
+  } else if (apiResult.data.temps !== null) {
+    // Fallback to old behavior for current temperature readings only
+    const timestampSeconds = Math.floor(Date.now() / 1000);
+    
     apiResult.data.temps.forEach((te: any) => {
       // find record in templog and add
       const foundRecord = currentTemps.value.find((ct: any) => ct.sensor === te.sensor);
