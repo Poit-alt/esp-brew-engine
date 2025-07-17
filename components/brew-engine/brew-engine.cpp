@@ -1828,6 +1828,22 @@ void BrewEngine::readLoop(void *arg)
 			uint64_t avgSensorId = 0xFFFFFFFFFFFFFFFF;
 			instance->sensorTempLogs[avgSensorId][current_raw_time] = avg;
 			
+			// Limit memory usage by keeping only the last 300 data points per sensor (5 minutes at 1 second intervals)
+			const size_t MAX_DATA_POINTS = 300;
+			for (auto &[sensorId, sensorLog] : instance->sensorTempLogs)
+			{
+				if (sensorLog.size() > MAX_DATA_POINTS)
+				{
+					// Remove oldest entries
+					auto it = sensorLog.begin();
+					size_t toRemove = sensorLog.size() - MAX_DATA_POINTS;
+					for (size_t i = 0; i < toRemove; ++i)
+					{
+						it = sensorLog.erase(it);
+					}
+				}
+			}
+			
 			// Add statistics data point every 6 cycles to reduce overhead
 			it++;
 			if (it > 5)
@@ -2359,6 +2375,31 @@ string BrewEngine::processCommand(const string &payLoad)
 
 		// Individual sensor temperature logs for persistent storage (including Control/Average)
 		json jSensorTempLogs = json::array({});
+		size_t totalDataPoints = 0;
+		for (auto const &[sensorId, sensorLog] : this->sensorTempLogs)
+		{
+			totalDataPoints += sensorLog.size();
+		}
+		ESP_LOGI(TAG, "Serializing %zu sensors with %zu total data points", this->sensorTempLogs.size(), totalDataPoints);
+		
+		// Emergency memory cleanup if free heap is too low
+		size_t freeHeap = esp_get_free_heap_size();
+		const size_t MIN_HEAP_THRESHOLD = 50000; // 50KB minimum free heap
+		if (freeHeap < MIN_HEAP_THRESHOLD) {
+			ESP_LOGW(TAG, "Low memory detected (%lu bytes), performing emergency cleanup", freeHeap);
+			const size_t EMERGENCY_MAX_DATA_POINTS = 60; // Reduce to 1 minute per sensor
+			for (auto &[sensorId, sensorLog] : this->sensorTempLogs) {
+				if (sensorLog.size() > EMERGENCY_MAX_DATA_POINTS) {
+					auto it = sensorLog.begin();
+					size_t toRemove = sensorLog.size() - EMERGENCY_MAX_DATA_POINTS;
+					for (size_t i = 0; i < toRemove; ++i) {
+						it = sensorLog.erase(it);
+					}
+				}
+			}
+			ESP_LOGI(TAG, "Emergency cleanup completed, free heap now: %lu bytes", esp_get_free_heap_size());
+		}
+		
 		for (auto const &[sensorId, sensorLog] : this->sensorTempLogs)
 		{
 			json jSensorTempLog;
@@ -2389,8 +2430,10 @@ string BrewEngine::processCommand(const string &payLoad)
 			}
 			else
 			{
-				// Send all temperature readings for this sensor
-				for (auto iter = sensorLog.rbegin(); iter != sensorLog.rend(); ++iter)
+				// Send only the last 30 temperature readings for this sensor (30 seconds) to prevent memory issues
+				size_t maxDataPointsToSend = 30;
+				size_t pointsSent = 0;
+				for (auto iter = sensorLog.rbegin(); iter != sensorLog.rend() && pointsSent < maxDataPointsToSend; ++iter, ++pointsSent)
 				{
 					json jTempItem;
 					jTempItem["time"] = iter->first;
@@ -2944,7 +2987,25 @@ string BrewEngine::processCommand(const string &payLoad)
 		jResultPayload["message"] = message;
 	}
 
-	string resultPayload = jResultPayload.dump();
+	// Log memory usage before JSON serialization
+	ESP_LOGI(TAG, "Free heap before JSON serialization: %lu bytes", esp_get_free_heap_size());
+	ESP_LOGI(TAG, "Min free heap: %lu bytes", esp_get_minimum_free_heap_size());
+
+	string resultPayload;
+	try {
+		resultPayload = jResultPayload.dump();
+		ESP_LOGD(TAG, "JSON serialization successful, size: %zu bytes", resultPayload.length());
+	} catch (const std::exception& e) {
+		ESP_LOGE(TAG, "JSON serialization failed: %s", e.what());
+		ESP_LOGE(TAG, "Free heap after failure: %lu bytes", esp_get_free_heap_size());
+		
+		// Return minimal error response
+		json errorResponse;
+		errorResponse["success"] = false;
+		errorResponse["message"] = "Memory allocation error during JSON serialization";
+		errorResponse["data"] = json::object();
+		resultPayload = errorResponse.dump();
+	}
 
 	return resultPayload;
 }
