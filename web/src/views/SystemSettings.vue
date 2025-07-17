@@ -17,6 +17,11 @@ const systemSettings = ref<ISystemSettings>({
   invertOutputs: false,
   mqttUri: "",
   temperatureScale: 0,
+  rtdSensorsEnabled: false,
+  spiMosiPin: 23,
+  spiMisoPin: 19,
+  spiClkPin: 18,
+  spiCsPin: 5,
 });
 
 // is same as enum TemperatureScale, but this wel never change, converting enum to options would be wastefull
@@ -224,6 +229,73 @@ const scaleChanged = () => {
         <v-col cols="12" md="3">
           <v-select :label='t("systemSettings.temperature_scale")' v-model="systemSettings.temperatureScale"
             :items="temperatureScales" @blur="scaleChanged" />
+        </v-col>
+      </v-row>
+
+      <v-row>
+        <v-col cols="12" md="12">
+          <h3>RTD Sensor Configuration (MAX31865)</h3>
+        </v-col>
+      </v-row>
+
+      <v-row>
+        <v-col cols="12" md="3">
+          <v-checkbox v-model="systemSettings.rtdSensorsEnabled" label="Enable RTD Sensors">
+            <template v-slot:append>
+              <v-tooltip text="Enable PT100/PT1000 RTD sensors via MAX31865 amplifier">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-checkbox>
+        </v-col>
+      </v-row>
+
+      <v-row v-if="systemSettings.rtdSensorsEnabled">
+        <v-col cols="12" md="3">
+          <v-text-field v-model.number="systemSettings.spiMosiPin" label="SPI MOSI Pin">
+            <template v-slot:append>
+              <v-tooltip text="SPI Master Out Slave In pin for MAX31865">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-text-field v-model.number="systemSettings.spiMisoPin" label="SPI MISO Pin">
+            <template v-slot:append>
+              <v-tooltip text="SPI Master In Slave Out pin for MAX31865">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-text-field v-model.number="systemSettings.spiClkPin" label="SPI Clock Pin">
+            <template v-slot:append>
+              <v-tooltip text="SPI Clock pin for MAX31865">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-text-field v-model.number="systemSettings.spiCsPin" label="SPI CS Pin">
+            <template v-slot:append>
+              <v-tooltip text="SPI Chip Select pin for MAX31865">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
         </v-col>
       </v-row>
 

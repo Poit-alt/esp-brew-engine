@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { mdiAltimeter, mdiCookieSettingsOutline, mdiFullscreen, mdiFullscreenExit, mdiHeatingCoil, mdiImport, mdiKnob, mdiReceiptTextClock, mdiThermometer, mdiThermometerLines, mdiWifi, mdiWrenchCogOutline } from "@mdi/js";
+import { mdiAltimeter, mdiChartLine, mdiCookieSettingsOutline, mdiFullscreen, mdiFullscreenExit, mdiHeatingCoil, mdiImport, mdiKnob, mdiReceiptTextClock, mdiThermometer, mdiThermometerLines, mdiWifi, mdiWrenchCogOutline } from "@mdi/js";
 import { ref } from "vue";
 import { useI18n } from "vue-i18n";
 const { t } = useI18n({ useScope: "global" });
@@ -10,7 +10,10 @@ const linksBrewing = ref([
   [mdiImport, t("links.import"), "import"],
 ]);
 
-const linksTools = ref([[mdiAltimeter, t("links.refractometer"), "refractometer"]]);
+const linksTools = ref([
+  [mdiAltimeter, t("links.refractometer"), "refractometer"],
+  [mdiChartLine, t("links.statistics"), "statistics"],
+]);
 
 const linksSettings = ref([
   [mdiReceiptTextClock, t("links.schedules"), "mashschedules"],

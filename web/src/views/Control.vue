@@ -17,6 +17,7 @@ import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Line } from "vue-chartjs";
 import { useI18n } from "vue-i18n";
 import BoostStatus from "@/enums/BoostStatus";
+import { mdiThermometer } from "@mdi/js";
 const { t } = useI18n({ useScope: "global" });
 
 const webConn = inject<WebConn>("webConn");
@@ -255,17 +256,32 @@ const chartData = computed(() => {
     }
   }
 
-  const realData = rawData.value.map((item) => ({
-    x: item.time * 1000,
-    y: item.temp,
-  }));
+  // Find Control/Average data from sensorTempLogs (special sensor ID: 18446744073709551615)
+  const avgSensorId = "18446744073709551615"; // 0xFFFFFFFFFFFFFFFF as string
+  const avgSensorData = currentTemps.value.find((ct) => ct.sensor === avgSensorId);
+  
+  let realData: Array<{x: number, y: number}> = [];
+  if (avgSensorData && avgSensorData.temps) {
+    realData = avgSensorData.temps
+      .filter((temp) => temp.temp !== -999) // Filter out invalid readings
+      .map((temp) => ({
+        x: temp.time * 1000,
+        y: temp.temp,
+      }));
+  }
 
   // also add the current value, out controller doesn't send identical temp point for performance reasons
-  if (lastGoodDataDate.value != null && temperature.value != null) {
-    realData.push({
-      x: Date.now(),
-      y: temperature.value,
-    });
+  if (lastGoodDataDate.value != null && temperature.value != null && realData.length > 0) {
+    const lastDataTime = realData[realData.length - 1]?.x || 0;
+    const currentTime = Date.now();
+    
+    // Only add current value if more than 1 second has passed since last data point
+    if (currentTime - lastDataTime > 1000) {
+      realData.push({
+        x: currentTime,
+        y: temperature.value,
+      });
+    }
   }
 
   let datasets = [
@@ -275,6 +291,7 @@ const chartData = computed(() => {
       borderColor: "rgba(255, 255, 255, 0.9)",
       lineTension: 0,
       fill: false,
+      pointRadius: 0,
       xAxisID: "xAxis",
       yAxisID: "yAxis",
       data: realData,
@@ -291,36 +308,41 @@ const chartData = computed(() => {
     },
   ];
 
-  const extraDataSets = currentTemps.value.map((extraSet) => {
-    const setData = extraSet.temps.map((temp) => ({
-      x: temp.time * 1000,
-      y: temp.temp,
-    }));
+  const extraDataSets = currentTemps.value
+    .filter((extraSet) => extraSet.sensor !== avgSensorId) // Exclude Control/Average sensor
+    .map((extraSet) => {
+      // Filter out disconnected sensor readings (temp === -999)
+      const setData = extraSet.temps
+        .filter((temp) => temp.temp !== -999)
+        .map((temp) => ({
+          x: temp.time * 1000,
+          y: temp.temp,
+        }));
 
-    let label = extraSet.sensor;
-    let { color } = extraSet;
-    const sensor = tempSensors.value.find((s) => s.id === extraSet.sensor);
+      let label = extraSet.sensor;
+      let { color } = extraSet;
+      const sensor = tempSensors.value.find((s) => s.id === extraSet.sensor);
 
-    if (sensor !== undefined) {
-      label = sensor.name;
-      color = sensor.color;
-    }
+      if (sensor !== undefined) {
+        label = sensor.name;
+        color = sensor.color;
+      }
 
-    const dataset = {
-      label,
-      backgroundColor: color,
-      borderColor: color,
-      lineWidth: 0.2,
-      lineTension: 0,
-      xAxisID: "xAxis",
-      yAxisID: "yAxis",
-      fill: false,
-      pointRadius: 0,
-      data: setData,
-    };
+      const dataset = {
+        label,
+        backgroundColor: color,
+        borderColor: color,
+        lineWidth: 0.2,
+        lineTension: 0,
+        xAxisID: "xAxis",
+        yAxisID: "yAxis",
+        fill: false,
+        pointRadius: 0,
+        data: setData,
+      };
 
-    return dataset;
-  });
+      return dataset;
+    }).filter(dataset => dataset.data.length > 0); // Remove datasets with no valid data points
 
   datasets = [...datasets, ...extraDataSets];
 
@@ -328,6 +350,63 @@ const chartData = computed(() => {
     labels: [],
     datasets,
   };
+});
+
+const currentSensorStatus = computed(() => {
+  const sensorStatus: Array<{
+    id: string;
+    name: string;
+    color: string;
+    currentTemp: number;
+    lastUpdateTime: number;
+    timeSinceUpdate: string;
+    isConnected: boolean;
+  }> = [];
+
+  // Get all sensors that are configured to show on the chart
+  const displaySensors = tempSensors.value.filter(sensor => sensor.show);
+
+  displaySensors.forEach(sensor => {
+    // Find the current temperature data for this sensor
+    const sensorData = currentTemps.value.find(ct => ct.sensor === sensor.id);
+    
+    let currentTemp = sensor.lastTemp || 0;
+    let lastUpdateTime = 0;
+    let isConnected = currentTemp !== -999;
+
+    if (sensorData && sensorData.temps.length > 0) {
+      // Get the most recent temperature reading
+      const latestReading = sensorData.temps[sensorData.temps.length - 1];
+      currentTemp = latestReading.temp;
+      lastUpdateTime = latestReading.time;
+      isConnected = currentTemp !== -999;
+    }
+
+    // Calculate time since last update
+    const now = Math.floor(Date.now() / 1000);
+    const secondsSinceUpdate = lastUpdateTime > 0 ? now - lastUpdateTime : 0;
+    
+    let timeSinceUpdate = "";
+    if (secondsSinceUpdate < 60) {
+      timeSinceUpdate = `${secondsSinceUpdate}s ago`;
+    } else if (secondsSinceUpdate < 3600) {
+      timeSinceUpdate = `${Math.floor(secondsSinceUpdate / 60)}m ago`;
+    } else {
+      timeSinceUpdate = `${Math.floor(secondsSinceUpdate / 3600)}h ago`;
+    }
+
+    sensorStatus.push({
+      id: sensor.id,
+      name: sensor.name,
+      color: sensor.color,
+      currentTemp: isConnected ? currentTemp : -999,
+      lastUpdateTime,
+      timeSinceUpdate: lastUpdateTime > 0 ? timeSinceUpdate : "No data",
+      isConnected
+    });
+  });
+
+  return sensorStatus;
 });
 
 const clearAllNotificationTimeouts = () => {
@@ -427,10 +506,47 @@ const getData = async () => {
 
   rawData.value = tempData;
 
-  // if there are more then 1 sensor we also get the raw data per sensor (whitout history)
-  const timestampSeconds = Math.floor(Date.now() / 1000);
-
-  if (apiResult.data.temps !== null) {
+  // Handle individual sensor temperature logs with persistent storage
+  if (apiResult.data.sensorTempLogs !== null && apiResult.data.sensorTempLogs.length > 0) {
+    apiResult.data.sensorTempLogs.forEach((sensorLog: any) => {
+      // Find existing record for this sensor
+      const foundRecord = currentTemps.value.find((ct: any) => ct.sensor === sensorLog.sensor);
+      
+      if (foundRecord === undefined) {
+        // Create new record with all historical data
+        const newRecord: ITempLog = {
+          sensor: sensorLog.sensor,
+          color: dynamicColor(),
+          temps: sensorLog.temps.map((temp: any) => ({
+            time: temp.time,
+            temp: temp.temp,
+          })),
+        };
+        currentTemps.value.push(newRecord);
+      } else {
+        // Merge new temperature data with existing data
+        const existingTemps = foundRecord.temps || [];
+        const newTemps = sensorLog.temps.map((temp: any) => ({
+          time: temp.time,
+          temp: temp.temp,
+        }));
+        
+        // Combine and sort by time to ensure proper ordering
+        const combinedTemps = [...existingTemps, ...newTemps];
+        combinedTemps.sort((a, b) => a.time - b.time);
+        
+        // Remove duplicates based on time
+        const uniqueTemps = combinedTemps.filter((temp, index, arr) => 
+          index === 0 || temp.time !== arr[index - 1].time
+        );
+        
+        foundRecord.temps = uniqueTemps;
+      }
+    });
+  } else if (apiResult.data.temps !== null) {
+    // Fallback to old behavior for current temperature readings only
+    const timestampSeconds = Math.floor(Date.now() / 1000);
+    
     apiResult.data.temps.forEach((te: any) => {
       // find record in templog and add
       const foundRecord = currentTemps.value.find((ct: any) => ct.sensor === te.sensor);
@@ -722,6 +838,59 @@ const labelTargetTemp = computed(() => {
       <v-row style="height: 50vh">
         <Line v-if="chartInitDone && chartData" :options="chartOptions" :data="chartData" />
       </v-row>
+      
+      <!-- Sensor Status Display -->
+      <v-row v-if="currentSensorStatus.length > 0" class="mb-4">
+        <v-col cols="12">
+          <v-card variant="outlined">
+            <v-card-title class="text-h6 pb-2">
+              <v-icon class="mr-2">{{ mdiThermometer }}</v-icon>
+              Temperature Sensors
+            </v-card-title>
+            <v-card-text>
+              <v-row>
+                <v-col 
+                  v-for="sensor in currentSensorStatus" 
+                  :key="sensor.id"
+                  cols="12" 
+                  sm="6" 
+                  md="4" 
+                  lg="3"
+                >
+                  <v-card 
+                    :color="sensor.isConnected ? 'surface-variant' : 'error'" 
+                    variant="tonal"
+                    class="pa-3"
+                  >
+                    <div class="d-flex align-center mb-2">
+                      <v-chip 
+                        :color="sensor.color" 
+                        size="small" 
+                        class="mr-2"
+                      >
+                        ●
+                      </v-chip>
+                      <span class="text-body-2 font-weight-medium">{{ sensor.name }}</span>
+                    </div>
+                    <div class="text-h6">
+                      <span v-if="sensor.isConnected">
+                        {{ sensor.currentTemp.toFixed(1) }}°{{ appStore.tempUnit || 'C' }}
+                      </span>
+                      <span v-else class="text-error">
+                        Disconnected
+                      </span>
+                    </div>
+                    <div class="text-caption text-medium-emphasis">
+                      {{ sensor.timeSinceUpdate }}
+                    </div>
+                  </v-card>
+                </v-col>
+              </v-row>
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+      
       <v-row>
         <v-col cols="12" md="3">
           <v-text-field v-model="displayStatus" readonly :label="$t('control.status')" />

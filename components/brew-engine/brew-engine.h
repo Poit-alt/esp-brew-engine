@@ -14,6 +14,7 @@
 #include <esp_http_server.h>
 #include "esp_ota_ops.h"
 #include "driver/gpio.h"
+#include "esp_system.h"
 
 #include <iostream>
 #include <string>
@@ -27,6 +28,7 @@
 
 #include "onewire_bus.h"
 #include "ds18b20.h"
+#include "max31865_driver.h"
 
 #include "mqtt_client.h"
 
@@ -40,10 +42,12 @@
 #include "notification.h"
 
 #include "settings-manager.h"
+#include "statistics-manager.h"
 
 #include "nlohmann_json.hpp"
 
 #define ONEWIRE_MAX_DS18B20 10
+#define MAX_RTD_SENSORS 5
 
 enum TemperatureScale
 {
@@ -79,6 +83,10 @@ private:
     void readTempSensorSettings();
     void detectOnewireTemperatureSensors();
     void initOneWire();
+    void detectRtdTemperatureSensors();
+    void initRtdSensors();
+    void cleanupRtdSensors();
+    bool reinitializeRtdSensor(TemperatureSensor *sensor);
     void initMqtt();
     void initHeaters();
     void readSystemSettings();
@@ -117,6 +125,7 @@ private:
     static string to_iso_8601(std::chrono::time_point<std::chrono::system_clock> t);
 
     SettingsManager *settingsManager;
+    StatisticsManager *statisticsManager;
     httpd_handle_t server;
 
     TemperatureScale temperatureScale = Celsius;
@@ -125,6 +134,7 @@ private:
     std::optional<float> overrideTargetTemperature = std::nullopt; // manualy overwritten temp
     std::map<uint64_t, float> currentTemperatures;                 // map with last temp for each sensor
     std::map<time_t, int8_t> tempLog;                              // integer log of averages, only used to show running history on web
+    std::map<uint64_t, std::map<time_t, float>> sensorTempLogs;    // individual sensor temperature logs for persistent storage
 
     // pid
     uint8_t pidOutput = 0;
@@ -173,6 +183,15 @@ private:
     gpio_num_t oneWire_PIN;
     gpio_num_t stir_PIN;
     gpio_num_t buzzer_PIN;
+
+    // MAX31865 RTD sensor configuration
+    gpio_num_t spi_mosi_pin;
+    gpio_num_t spi_miso_pin;
+    gpio_num_t spi_clk_pin;
+    gpio_num_t spi_cs_pin;
+    std::vector<max31865_t*> rtdSensors;
+    uint8_t rtdSensorCount;
+    bool rtdSensorsEnabled;
 
     uint8_t buzzerTime; // in seconds
 
