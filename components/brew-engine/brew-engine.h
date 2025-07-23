@@ -12,6 +12,7 @@
 
 #include "esp_log.h"
 #include <esp_http_server.h>
+#include "esp_http_client.h"
 #include "esp_ota_ops.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
@@ -204,6 +205,20 @@ private:
     esp_mqtt_client_handle_t mqttClient;
     string mqttTopic = "";
     string mqttTopicLog = "";
+
+    // InfluxDB
+    bool influxdbEnabled = false;
+    string influxdbUrl = "";
+    string influxdbToken = "";
+    string influxdbOrg = "";
+    string influxdbBucket = "";
+    uint32_t currentSessionId = 0;
+    void initInfluxDB();
+    string escapeInfluxDBTagValue(const string &value);
+    void sendToInfluxDB(const string &measurement, const string &fields, const string &tags = "");
+    string queryInfluxDB(const string &query);
+    json getInfluxDBStatistics(const json &requestData);
+    json getInfluxDBSessionData(const json &requestData);
 
     // stirring/pumping
     TaskHandle_t stirLoopHandle = NULL;

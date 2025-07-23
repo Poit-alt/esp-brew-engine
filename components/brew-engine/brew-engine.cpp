@@ -76,11 +76,13 @@ void BrewEngine::Init()
 
 	this->initMqtt();
 
+	this->initInfluxDB();
+
 	this->statisticsManager->Init();
 
 	this->run = true;
 
-	xTaskCreate(&this->readLoop, "readloop_task", 4096, this, 5, NULL);
+	xTaskCreate(&this->readLoop, "readloop_task", 8192, this, 5, NULL);
 
 	this->server = this->startWebserver();
 }
@@ -124,6 +126,12 @@ void BrewEngine::readSystemSettings()
 
 	// mqtt
 	this->mqttUri = this->settingsManager->Read("mqttUri", (string)CONFIG_MQTT_URI);
+
+	// InfluxDB
+	this->influxdbUrl = this->settingsManager->Read("influxdbUrl", (string)"");
+	this->influxdbToken = this->settingsManager->Read("influxdbToken", (string)"");
+	this->influxdbOrg = this->settingsManager->Read("influxdbOrg", (string)"");
+	this->influxdbBucket = this->settingsManager->Read("influxdbBucket", (string)"");
 
 	// temperature scale
 	uint8_t defaultConfigScale = 0; // default to Celsius
@@ -170,6 +178,29 @@ void BrewEngine::saveSystemSettingsJson(const json &config)
 		this->settingsManager->Write("mqttUri", (string)config["mqttUri"]);
 		this->mqttUri = config["mqttUri"];
 	}
+	
+	// InfluxDB configuration
+	if (!config["influxdbUrl"].is_null() && config["influxdbUrl"].is_string())
+	{
+		this->settingsManager->Write("influxdbUrl", (string)config["influxdbUrl"]);
+		this->influxdbUrl = config["influxdbUrl"];
+	}
+	if (!config["influxdbToken"].is_null() && config["influxdbToken"].is_string())
+	{
+		this->settingsManager->Write("influxdbToken", (string)config["influxdbToken"]);
+		this->influxdbToken = config["influxdbToken"];
+	}
+	if (!config["influxdbOrg"].is_null() && config["influxdbOrg"].is_string())
+	{
+		this->settingsManager->Write("influxdbOrg", (string)config["influxdbOrg"]);
+		this->influxdbOrg = config["influxdbOrg"];
+	}
+	if (!config["influxdbBucket"].is_null() && config["influxdbBucket"].is_string())
+	{
+		this->settingsManager->Write("influxdbBucket", (string)config["influxdbBucket"]);
+		this->influxdbBucket = config["influxdbBucket"];
+	}
+	
 	if (!config["temperatureScale"].is_null() && config["temperatureScale"].is_number())
 	{
 		uint8_t scale = (uint8_t)config["temperatureScale"];
@@ -807,6 +838,384 @@ void BrewEngine::initMqtt()
 	this->mqttEnabled = true;
 
 	ESP_LOGI(TAG, "initMqtt: Done");
+}
+
+void BrewEngine::initInfluxDB()
+{
+	// return if no URL is configured
+	if (this->influxdbUrl.empty() || this->influxdbToken.empty() || this->influxdbOrg.empty() || this->influxdbBucket.empty())
+	{
+		ESP_LOGI(TAG, "InfluxDB not configured, skipping initialization");
+		return;
+	}
+
+	ESP_LOGI(TAG, "initInfluxDB: Start");
+	
+	// Generate a unique session ID for this boot
+	this->currentSessionId = esp_random();
+	
+	this->influxdbEnabled = true;
+	
+	ESP_LOGI(TAG, "initInfluxDB: Done - Session ID: %lu", this->currentSessionId);
+}
+
+string BrewEngine::escapeInfluxDBTagValue(const string &value)
+{
+	// Pre-allocate with extra space for escaping
+	string escaped;
+	escaped.reserve(value.length() + 20);
+	
+	for (char c : value) {
+		if (c == ' ' || c == ',' || c == '=') {
+			escaped += '\\';
+		}
+		escaped += c;
+	}
+	return escaped;
+}
+
+void BrewEngine::sendToInfluxDB(const string &measurement, const string &fields, const string &tags)
+{
+	if (!this->influxdbEnabled)
+	{
+		return;
+	}
+
+	// Construct InfluxDB line protocol
+	string lineProtocol = measurement;
+	
+	// Add tags if provided
+	if (!tags.empty())
+	{
+		lineProtocol += "," + tags;
+	}
+	
+	// Add default tags
+	lineProtocol += ",host=" + this->Hostname;
+	lineProtocol += ",session_id=" + to_string(this->currentSessionId);
+	
+	// Add fields and timestamp
+	lineProtocol += " " + fields;
+	lineProtocol += " " + to_string(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
+	
+	ESP_LOGD(TAG, "InfluxDB line: %s", lineProtocol.c_str());
+	
+	// Configure HTTP client with static buffers
+	static char urlBuffer[512];
+	static char authBuffer[256];
+	
+	snprintf(urlBuffer, sizeof(urlBuffer), "%s/api/v2/write?org=%s&bucket=%s", 
+		this->influxdbUrl.c_str(), this->influxdbOrg.c_str(), this->influxdbBucket.c_str());
+	snprintf(authBuffer, sizeof(authBuffer), "Bearer %s", this->influxdbToken.c_str());
+	
+	ESP_LOGI(TAG, "InfluxDB URL: %s", urlBuffer);
+	ESP_LOGI(TAG, "InfluxDB Token length: %d", this->influxdbToken.length());
+	
+	esp_http_client_config_t config = {};
+	config.url = urlBuffer;
+	config.method = HTTP_METHOD_POST;
+	config.timeout_ms = 5000;
+	config.disable_auto_redirect = true;
+	
+	esp_http_client_handle_t client = esp_http_client_init(&config);
+	if (client == NULL) {
+		ESP_LOGE(TAG, "Failed to initialize HTTP client for InfluxDB");
+		return;
+	}
+	
+	// Set headers - try setting both ways
+	esp_http_client_set_header(client, "Content-Type", "text/plain");
+	esp_http_client_set_header(client, "Accept", "*/*");
+	
+	// Set authorization header after client init
+	esp_err_t header_err = esp_http_client_set_header(client, "authorization", authBuffer);
+	ESP_LOGI(TAG, "Set authorization header (lowercase) result: %s", esp_err_to_name(header_err));
+	
+	// Also try uppercase
+	header_err = esp_http_client_set_header(client, "Authorization", authBuffer);
+	ESP_LOGI(TAG, "Set Authorization header (uppercase) result: %s", esp_err_to_name(header_err));
+	
+	// Set POST data
+	ESP_LOGI(TAG, "InfluxDB data: %s", lineProtocol.c_str());
+	esp_http_client_set_post_field(client, lineProtocol.c_str(), lineProtocol.length());
+	
+	// Perform request
+	esp_err_t err = esp_http_client_perform(client);
+	
+	if (err == ESP_OK)
+	{
+		int status_code = esp_http_client_get_status_code(client);
+		if (status_code == 204)
+		{
+			ESP_LOGI(TAG, "InfluxDB write successful");
+		}
+		else
+		{
+			// Get response body for error details
+			int content_length = esp_http_client_get_content_length(client);
+			if (content_length > 0 && content_length < 1024) {
+				char response_buffer[1024];
+				int data_read = esp_http_client_read_response(client, response_buffer, sizeof(response_buffer) - 1);
+				if (data_read > 0) {
+					response_buffer[data_read] = '\0';
+					ESP_LOGW(TAG, "InfluxDB error response: %s", response_buffer);
+				}
+			}
+			ESP_LOGW(TAG, "InfluxDB write failed with status: %d", status_code);
+		}
+	}
+	else
+	{
+		ESP_LOGE(TAG, "InfluxDB HTTP request failed: %s", esp_err_to_name(err));
+	}
+	
+	esp_http_client_cleanup(client);
+}
+
+string BrewEngine::queryInfluxDB(const string &query)
+{
+	if (!this->influxdbEnabled)
+	{
+		return "";
+	}
+
+	ESP_LOGD(TAG, "InfluxDB query: %s", query.c_str());
+	
+	// URL encode the query
+	string encodedQuery = query;
+	// TODO: Implement proper URL encoding if needed
+	
+	// Configure HTTP client for query
+	string queryUrl = this->influxdbUrl + "/api/v2/query?org=" + this->influxdbOrg;
+	esp_http_client_config_t config = {};
+	config.url = queryUrl.c_str();
+	config.method = HTTP_METHOD_POST;
+	config.timeout_ms = 10000;
+	config.disable_auto_redirect = true;
+	
+	esp_http_client_handle_t client = esp_http_client_init(&config);
+	
+	// Set headers
+	esp_http_client_set_header(client, "Authorization", ("Bearer " + this->influxdbToken).c_str());
+	esp_http_client_set_header(client, "Content-Type", "application/vnd.flux");
+	esp_http_client_set_header(client, "Accept", "application/json");
+	
+	// Set POST data (Flux query)
+	string fluxQuery = "from(bucket:\"" + this->influxdbBucket + "\") " + query;
+	esp_http_client_set_post_field(client, fluxQuery.c_str(), fluxQuery.length());
+	
+	// Perform request
+	esp_err_t err = esp_http_client_perform(client);
+	
+	string response = "";
+	if (err == ESP_OK)
+	{
+		int status_code = esp_http_client_get_status_code(client);
+		int content_length = esp_http_client_get_content_length(client);
+		
+		if (status_code == 200 && content_length > 0)
+		{
+			char *buffer = (char *)malloc(content_length + 1);
+			if (buffer)
+			{
+				int read_length = esp_http_client_read(client, buffer, content_length);
+				if (read_length > 0)
+				{
+					buffer[read_length] = '\0';
+					response = string(buffer);
+				}
+				free(buffer);
+			}
+		}
+		else
+		{
+			ESP_LOGW(TAG, "InfluxDB query failed with status: %d", status_code);
+		}
+	}
+	else
+	{
+		ESP_LOGE(TAG, "InfluxDB query HTTP request failed: %s", esp_err_to_name(err));
+	}
+	
+	esp_http_client_cleanup(client);
+	return response;
+}
+
+json BrewEngine::getInfluxDBStatistics(const json &requestData)
+{
+	if (!this->influxdbEnabled)
+	{
+		// Fallback to local statistics if InfluxDB is not enabled
+		json result;
+		
+		// Get sessions
+		vector<BrewSession> sessions = this->statisticsManager->GetSessionList();
+		json jSessions = json::array();
+		for (const auto& session : sessions) {
+			json jSession;
+			jSession["sessionId"] = session.sessionId;
+			jSession["scheduleName"] = session.scheduleName;
+			jSession["startTime"] = session.startTime;
+			jSession["endTime"] = session.endTime;
+			jSession["duration"] = session.totalDuration;
+			jSession["dataPoints"] = session.dataPoints;
+			jSession["avgTemperature"] = session.avgTemperature;
+			jSession["minTemperature"] = session.minTemperature;
+			jSession["maxTemperature"] = session.maxTemperature;
+			jSession["completed"] = session.completed;
+			jSessions.push_back(jSession);
+		}
+		
+		// Get stats
+		map<string, uint32_t> stats = this->statisticsManager->GetSessionStats();
+		
+		// Get config
+		json config = {
+			{"maxSessions", this->statisticsManager->GetMaxSessions()},
+			{"currentSessionActive", this->statisticsManager->IsSessionActive()},
+			{"currentSessionId", this->statisticsManager->GetCurrentSessionId()},
+			{"currentDataPoints", this->statisticsManager->GetCurrentSessionDataPoints()}
+		};
+		
+		result["sessions"] = jSessions;
+		result["stats"] = stats;
+		result["config"] = config;
+		
+		return result;
+	}
+
+	json result;
+	
+	// Get session list with basic statistics
+	string sessionQuery = R"(
+		|> range(start: -30d)
+		|> filter(fn: (r) => r["_measurement"] == "session_metadata")
+		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
+		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+		|> sort(columns: ["_time"], desc: true)
+		|> limit(n: 50)
+	)";
+	
+	string sessionResponse = this->queryInfluxDB(sessionQuery);
+	
+	// Get temperature statistics for sessions
+	string tempQuery = R"(
+		|> range(start: -30d)
+		|> filter(fn: (r) => r["_measurement"] == "temperature")
+		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
+		|> group(columns: ["session_id"])
+		|> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+		|> yield(name: "session_temps")
+	)";
+	
+	string tempResponse = this->queryInfluxDB(tempQuery);
+	
+	// Process the responses and build the result
+	json sessions = json::array();
+	json stats = {
+		{"totalSessions", 0},
+		{"totalBrewTime", 0},
+		{"avgSessionDuration", 0}
+	};
+	
+	json config = {
+		{"maxSessions", 100},
+		{"currentSessionActive", this->controlRun},
+		{"currentSessionId", to_string(this->currentSessionId)},
+		{"currentDataPoints", 0},
+		{"retentionPolicy", "30d"}
+	};
+	
+	// TODO: Parse InfluxDB response and populate sessions array
+	// For now, return basic structure
+	
+	result["sessions"] = sessions;
+	result["stats"] = stats;
+	result["config"] = config;
+	
+	return result;
+}
+
+json BrewEngine::getInfluxDBSessionData(const json &requestData)
+{
+	if (!this->influxdbEnabled)
+	{
+		// Fallback to local statistics if InfluxDB is not enabled
+		uint32_t sessionId = requestData["sessionId"];
+		BrewSession session = this->statisticsManager->GetSessionById(sessionId);
+		
+		if (session.sessionId == 0) {
+			// Session not found
+			json result;
+			result["error"] = "Session not found";
+			return result;
+		}
+		
+		vector<TempDataPoint> sessionData = this->statisticsManager->GetSessionData(sessionId);
+		
+		json result;
+		result["sessionId"] = session.sessionId;
+		result["scheduleName"] = session.scheduleName;
+		result["startTime"] = session.startTime;
+		result["endTime"] = session.endTime;
+		result["duration"] = session.totalDuration;
+		result["avgTemperature"] = session.avgTemperature;
+		result["minTemperature"] = session.minTemperature;
+		result["maxTemperature"] = session.maxTemperature;
+		result["completed"] = session.completed;
+		
+		json jData = json::array();
+		for (const auto& point : sessionData) {
+			json jPoint;
+			jPoint["timestamp"] = point.timestamp;
+			jPoint["avgTemp"] = (int)point.avgTemp;
+			jPoint["targetTemp"] = (int)point.targetTemp;
+			jPoint["pidOutput"] = (int)point.pidOutput;
+			jData.push_back(jPoint);
+		}
+		
+		result["data"] = jData;
+		return result;
+	}
+
+	json result;
+	
+	string sessionId = requestData["sessionId"];
+	string resolution = requestData.contains("resolution") ? requestData["resolution"] : "1m";
+	
+	// Get session metadata
+	string metadataQuery = R"(
+		|> range(start: -30d)
+		|> filter(fn: (r) => r["_measurement"] == "session_metadata")
+		|> filter(fn: (r) => r["session_id"] == ")" + sessionId + R"(")
+		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
+		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+		|> last()
+	)";
+	
+	string metadataResponse = this->queryInfluxDB(metadataQuery);
+	
+	// Get temperature data with specified resolution
+	string tempQuery = R"(
+		|> range(start: -30d)
+		|> filter(fn: (r) => r["_measurement"] == "temperature")
+		|> filter(fn: (r) => r["session_id"] == ")" + sessionId + R"(")
+		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
+		|> aggregateWindow(every: )" + resolution + R"(, fn: mean, createEmpty: false)
+		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+		|> sort(columns: ["_time"])
+	)";
+	
+	string tempResponse = this->queryInfluxDB(tempQuery);
+	
+	// Process the responses and build the result
+	result["sessionId"] = sessionId;
+	result["data"] = json::array();
+	
+	// TODO: Parse InfluxDB response and populate data array
+	// For now, return basic structure
+	
+	return result;
 }
 
 void BrewEngine::initOneWire()
@@ -1865,6 +2274,36 @@ void BrewEngine::readLoop(void *arg)
 
 				esp_mqtt_client_publish(instance->mqttClient, instance->mqttTopic.c_str(), payload.c_str(), 0, 1, 1);
 			}
+
+			// Send to InfluxDB
+			if (instance->influxdbEnabled)
+			{
+				string fields = "temperature=" + to_string(instance->temperature) + 
+								",target_temperature=" + to_string(instance->targetTemperature) + 
+								",pid_output=" + to_string(instance->pidOutput);
+				
+				string tags = "status=" + instance->escapeInfluxDBTagValue(instance->statusText);
+				if (instance->controlRun && !instance->selectedMashScheduleName.empty())
+				{
+					tags += ",schedule=" + instance->escapeInfluxDBTagValue(instance->selectedMashScheduleName);
+				}
+				
+				instance->sendToInfluxDB("temperature", fields, tags);
+				
+				// Send individual sensor readings
+				for (auto const &[sensorId, sensor] : instance->sensors)
+				{
+					if (sensor->show && sensor->lastTemp != -999)
+					{
+						string sensorFields = "temperature=" + to_string(sensor->lastTemp);
+						string sensorTags = "sensor_id=" + to_string(sensorId) + 
+										   ",sensor_name=" + instance->escapeInfluxDBTagValue(sensor->name) + 
+										   ",sensor_type=" + to_string(sensor->sensorType);
+						
+						instance->sendToInfluxDB("sensor_temperature", sensorFields, sensorTags);
+					}
+				}
+			}
 		}
 	}
 
@@ -2556,6 +2995,16 @@ string BrewEngine::processCommand(const string &payLoad)
 
 		this->start();
 		this->statisticsManager->StartSession(this->selectedMashScheduleName);
+		
+		// Log session start to InfluxDB
+		if (this->influxdbEnabled)
+		{
+			time_t startTime = time(0);
+			string fields = "schedule_name=\"" + this->selectedMashScheduleName + "\"" +
+							",start_time=" + to_string(startTime) +
+							",completed=false";
+			this->sendToInfluxDB("session_metadata", fields);
+		}
 	}
 	else if (command == "StartStir")
 	{
@@ -2565,6 +3014,15 @@ string BrewEngine::processCommand(const string &payLoad)
 	{
 		this->stop();
 		this->statisticsManager->EndSession();
+		
+		// Log session end to InfluxDB
+		if (this->influxdbEnabled)
+		{
+			time_t endTime = time(0);
+			string fields = "end_time=" + to_string(endTime) +
+							",completed=true";
+			this->sendToInfluxDB("session_metadata", fields);
+		}
 	}
 	else if (command == "StopStir")
 	{
@@ -2822,12 +3280,32 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"spiMisoPin", this->spi_miso_pin},
 			{"spiClkPin", this->spi_clk_pin},
 			{"spiCsPin", this->spi_cs_pin},
+			{"influxdbUrl", this->influxdbUrl},
+			{"influxdbToken", this->influxdbToken},
+			{"influxdbOrg", this->influxdbOrg},
+			{"influxdbBucket", this->influxdbBucket},
 		};
 	}
 	else if (command == "SaveSystemSettings")
 	{
 		this->saveSystemSettingsJson(data);
 		message = "Please restart device for changes to have effect!";
+	}
+	else if (command == "TestInfluxDB")
+	{
+		if (this->influxdbUrl.empty() || this->influxdbToken.empty() || 
+		    this->influxdbOrg.empty() || this->influxdbBucket.empty())
+		{
+			message = "InfluxDB configuration incomplete";
+			success = false;
+		}
+		else
+		{
+			// Test connection with a dummy data point
+			string testData = "test_connection,source=brew_engine value=1";
+			this->sendToInfluxDB("test_connection", "value=1", "");
+			message = "InfluxDB connection test completed - check logs for results";
+		}
 	}
 	else if (command == "Reboot")
 	{
@@ -2854,15 +3332,21 @@ string BrewEngine::processCommand(const string &payLoad)
 	}
 	else if (command == "GetStatistics")
 	{
-		vector<BrewSession> sessions = this->statisticsManager->GetSessionList();
-		json jSessions = json::array();
-		
-		for (const auto& session : sessions) {
-			json jSession;
-			jSession["sessionId"] = session.sessionId;
-			jSession["scheduleName"] = session.scheduleName;
-			jSession["startTime"] = session.startTime;
-			jSession["endTime"] = session.endTime;
+		if (this->influxdbEnabled)
+		{
+			resultData = this->getInfluxDBStatistics(data);
+		}
+		else
+		{
+			vector<BrewSession> sessions = this->statisticsManager->GetSessionList();
+			json jSessions = json::array();
+			
+			for (const auto& session : sessions) {
+				json jSession;
+				jSession["sessionId"] = session.sessionId;
+				jSession["scheduleName"] = session.scheduleName;
+				jSession["startTime"] = session.startTime;
+				jSession["endTime"] = session.endTime;
 			jSession["duration"] = session.totalDuration;
 			jSession["dataPoints"] = session.dataPoints;
 			jSession["avgTemperature"] = session.avgTemperature;
@@ -2870,21 +3354,22 @@ string BrewEngine::processCommand(const string &payLoad)
 			jSession["maxTemperature"] = session.maxTemperature;
 			jSession["completed"] = session.completed;
 			jSessions.push_back(jSession);
+			}
+			
+			resultData["sessions"] = jSessions;
+			
+			map<string, uint32_t> stats = this->statisticsManager->GetSessionStats();
+			resultData["stats"] = stats;
+			
+			json jConfig;
+			jConfig["maxSessions"] = this->statisticsManager->GetMaxSessions();
+			jConfig["currentSessionActive"] = this->statisticsManager->IsSessionActive();
+			if (this->statisticsManager->IsSessionActive()) {
+				jConfig["currentSessionId"] = this->statisticsManager->GetCurrentSessionId();
+				jConfig["currentDataPoints"] = this->statisticsManager->GetCurrentSessionDataPoints();
+			}
+			resultData["config"] = jConfig;
 		}
-		
-		resultData["sessions"] = jSessions;
-		
-		map<string, uint32_t> stats = this->statisticsManager->GetSessionStats();
-		resultData["stats"] = stats;
-		
-		json jConfig;
-		jConfig["maxSessions"] = this->statisticsManager->GetMaxSessions();
-		jConfig["currentSessionActive"] = this->statisticsManager->IsSessionActive();
-		if (this->statisticsManager->IsSessionActive()) {
-			jConfig["currentSessionId"] = this->statisticsManager->GetCurrentSessionId();
-			jConfig["currentDataPoints"] = this->statisticsManager->GetCurrentSessionDataPoints();
-		}
-		resultData["config"] = jConfig;
 	}
 	else if (command == "GetSessionData")
 	{
@@ -2893,15 +3378,21 @@ string BrewEngine::processCommand(const string &payLoad)
 			success = false;
 		}
 		else {
-			uint32_t sessionId = data["sessionId"];
-			BrewSession session = this->statisticsManager->GetSessionById(sessionId);
-			
-			if (session.sessionId == 0) {
-				message = "Session not found";
-				success = false;
+			if (this->influxdbEnabled)
+			{
+				resultData = this->getInfluxDBSessionData(data);
 			}
-			else {
-				vector<TempDataPoint> sessionData = this->statisticsManager->GetSessionData(sessionId);
+			else
+			{
+				uint32_t sessionId = data["sessionId"];
+				BrewSession session = this->statisticsManager->GetSessionById(sessionId);
+				
+				if (session.sessionId == 0) {
+					message = "Session not found";
+					success = false;
+				}
+				else {
+					vector<TempDataPoint> sessionData = this->statisticsManager->GetSessionData(sessionId);
 				
 				json jSession;
 				jSession["sessionId"] = session.sessionId;
@@ -2924,8 +3415,9 @@ string BrewEngine::processCommand(const string &payLoad)
 					jData.push_back(jPoint);
 				}
 				
-				jSession["data"] = jData;
-				resultData = jSession;
+					jSession["data"] = jData;
+					resultData = jSession;
+				}
 			}
 		}
 	}

@@ -7,6 +7,10 @@ export interface ISystemSettings {
   buzzerTime: number;
   invertOutputs: boolean;
   mqttUri: string;
+  influxdbUrl: string;
+  influxdbToken: string;
+  influxdbOrg: string;
+  influxdbBucket: string;
   temperatureScale: TemperatureScale;
   rtdSensorsEnabled: boolean;
   spiMosiPin: number;

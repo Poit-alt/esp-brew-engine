@@ -16,6 +16,10 @@ const systemSettings = ref<ISystemSettings>({
   buzzerTime: 2,
   invertOutputs: false,
   mqttUri: "",
+  influxdbUrl: "",
+  influxdbToken: "",
+  influxdbOrg: "",
+  influxdbBucket: "",
   temperatureScale: 0,
   rtdSensorsEnabled: false,
   spiMosiPin: 23,
@@ -136,6 +140,27 @@ const scaleChanged = () => {
   alertType.value = "info";
   alert.value = t("systemSettings.mash_cant_be_converted");
 };
+
+const testInfluxDB = async () => {
+  if (!systemSettings.value.influxdbUrl || !systemSettings.value.influxdbToken || 
+      !systemSettings.value.influxdbOrg || !systemSettings.value.influxdbBucket) {
+    alert.value = "Please fill in all InfluxDB configuration fields";
+    alertType.value = "warning";
+    return;
+  }
+
+  const requestData = {
+    command: "TestInfluxDB",
+    data: null,
+  };
+
+  const result = await webConn?.doPostRequest(requestData);
+  if (result?.message != null) {
+    alert.value = result?.message;
+    alertType.value = result?.success ? "success" : "error";
+    window.scrollTo(0, 0);
+  }
+};
 </script>
 
 <template>
@@ -222,6 +247,74 @@ const scaleChanged = () => {
               </v-tooltip>
             </template>
           </v-text-field>
+        </v-col>
+      </v-row>
+
+      <v-row>
+        <v-col cols="12" md="12">
+          <h3>InfluxDB Configuration</h3>
+        </v-col>
+      </v-row>
+
+      <v-row>
+        <v-col cols="12" md="3">
+          <v-text-field v-model="systemSettings.influxdbUrl" placeholder="http://localhost:8086"
+            label="InfluxDB URL">
+            <template v-slot:append>
+              <v-tooltip text="InfluxDB server URL">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-text-field v-model="systemSettings.influxdbToken" type="password"
+            label="InfluxDB Token">
+            <template v-slot:append>
+              <v-tooltip text="InfluxDB authentication token">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+      </v-row>
+
+      <v-row>
+        <v-col cols="12" md="3">
+          <v-text-field v-model="systemSettings.influxdbOrg" 
+            label="InfluxDB Organization">
+            <template v-slot:append>
+              <v-tooltip text="InfluxDB organization name">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-text-field v-model="systemSettings.influxdbBucket" 
+            label="InfluxDB Bucket">
+            <template v-slot:append>
+              <v-tooltip text="InfluxDB bucket name for data storage">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+      </v-row>
+
+      <v-row>
+        <v-col cols="12" md="3">
+          <v-btn color="info" variant="outlined" class="mt-2" @click="testInfluxDB">
+            Test InfluxDB Connection
+          </v-btn>
         </v-col>
       </v-row>
 
