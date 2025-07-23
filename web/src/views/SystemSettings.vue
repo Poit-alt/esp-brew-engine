@@ -20,6 +20,7 @@ const systemSettings = ref<ISystemSettings>({
   influxdbToken: "",
   influxdbOrg: "",
   influxdbBucket: "",
+  influxdbSendInterval: 10,
   temperatureScale: 0,
   rtdSensorsEnabled: false,
   spiMosiPin: 23,
@@ -301,6 +302,18 @@ const testInfluxDB = async () => {
             label="InfluxDB Bucket">
             <template v-slot:append>
               <v-tooltip text="InfluxDB bucket name for data storage">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-text-field v-model.number="systemSettings.influxdbSendInterval" 
+            label="Send Interval (seconds)" type="number" min="1" max="300">
+            <template v-slot:append>
+              <v-tooltip text="How often to send data to InfluxDB (1-300 seconds)">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>

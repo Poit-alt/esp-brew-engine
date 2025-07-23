@@ -212,6 +212,8 @@ private:
     string influxdbToken = "";
     string influxdbOrg = "";
     string influxdbBucket = "";
+    uint16_t influxdbSendInterval = 10; // seconds between database writes
+    system_clock::time_point lastInfluxDBSend;
     uint32_t currentSessionId = 0;
     void initInfluxDB();
     string escapeInfluxDBTagValue(const string &value);

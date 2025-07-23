@@ -11,6 +11,7 @@ export interface ISystemSettings {
   influxdbToken: string;
   influxdbOrg: string;
   influxdbBucket: string;
+  influxdbSendInterval: number;
   temperatureScale: TemperatureScale;
   rtdSensorsEnabled: boolean;
   spiMosiPin: number;

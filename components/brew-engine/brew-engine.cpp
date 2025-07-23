@@ -132,6 +132,7 @@ void BrewEngine::readSystemSettings()
 	this->influxdbToken = this->settingsManager->Read("influxdbToken", (string)"");
 	this->influxdbOrg = this->settingsManager->Read("influxdbOrg", (string)"");
 	this->influxdbBucket = this->settingsManager->Read("influxdbBucket", (string)"");
+	this->influxdbSendInterval = this->settingsManager->Read("influxdbInt", (uint16_t)10);
 
 	// temperature scale
 	uint8_t defaultConfigScale = 0; // default to Celsius
@@ -199,6 +200,16 @@ void BrewEngine::saveSystemSettingsJson(const json &config)
 	{
 		this->settingsManager->Write("influxdbBucket", (string)config["influxdbBucket"]);
 		this->influxdbBucket = config["influxdbBucket"];
+	}
+	if (!config["influxdbSendInterval"].is_null() && config["influxdbSendInterval"].is_number())
+	{
+		uint16_t interval = config["influxdbSendInterval"];
+		// Validate interval is between 1 and 300 seconds
+		if (interval >= 1 && interval <= 300)
+		{
+			this->settingsManager->Write("influxdbInt", interval);
+			this->influxdbSendInterval = interval;
+		}
 	}
 	
 	if (!config["temperatureScale"].is_null() && config["temperatureScale"].is_number())
@@ -855,6 +866,9 @@ void BrewEngine::initInfluxDB()
 	this->currentSessionId = esp_random();
 	
 	this->influxdbEnabled = true;
+	
+	// Initialize last send time to allow immediate first send
+	this->lastInfluxDBSend = system_clock::now() - seconds(this->influxdbSendInterval);
 	
 	ESP_LOGI(TAG, "initInfluxDB: Done - Session ID: %lu", this->currentSessionId);
 }
@@ -2275,9 +2289,15 @@ void BrewEngine::readLoop(void *arg)
 				esp_mqtt_client_publish(instance->mqttClient, instance->mqttTopic.c_str(), payload.c_str(), 0, 1, 1);
 			}
 
-			// Send to InfluxDB
+			// Send to InfluxDB (with interval check)
 			if (instance->influxdbEnabled)
 			{
+				auto now = system_clock::now();
+				auto timeSinceLastSend = duration_cast<seconds>(now - instance->lastInfluxDBSend).count();
+				
+				if (timeSinceLastSend >= instance->influxdbSendInterval)
+				{
+					instance->lastInfluxDBSend = now;
 				string fields = "temperature=" + to_string(instance->temperature) + 
 								",target_temperature=" + to_string(instance->targetTemperature) + 
 								",pid_output=" + to_string(instance->pidOutput);
@@ -2302,6 +2322,7 @@ void BrewEngine::readLoop(void *arg)
 						
 						instance->sendToInfluxDB("sensor_temperature", sensorFields, sensorTags);
 					}
+				}
 				}
 			}
 		}
@@ -3284,6 +3305,7 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"influxdbToken", this->influxdbToken},
 			{"influxdbOrg", this->influxdbOrg},
 			{"influxdbBucket", this->influxdbBucket},
+			{"influxdbSendInterval", this->influxdbSendInterval},
 		};
 	}
 	else if (command == "SaveSystemSettings")
