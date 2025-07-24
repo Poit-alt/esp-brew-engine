@@ -135,7 +135,7 @@ private:
     std::optional<float> overrideTargetTemperature = std::nullopt; // manualy overwritten temp
     std::map<uint64_t, float> currentTemperatures;                 // map with last temp for each sensor
     std::map<time_t, int8_t> tempLog;                              // integer log of averages, only used to show running history on web
-    std::map<uint64_t, std::map<time_t, float>> sensorTempLogs;    // individual sensor temperature logs for persistent storage
+    // sensorTempLogs removed - will fetch from database instead to save memory
 
     // pid
     uint8_t pidOutput = 0;

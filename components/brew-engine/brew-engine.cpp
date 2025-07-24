@@ -1625,8 +1625,7 @@ void BrewEngine::start()
 		// clear old temp log
 		this->tempLog.clear();
 		
-		// clear old sensor temperature logs
-		this->sensorTempLogs.clear();
+		// sensorTempLogs removed - will use database instead
 
 		// also clear old steps
 		for (auto const &step : this->executionSteps)
@@ -2229,8 +2228,7 @@ void BrewEngine::readLoop(void *arg)
 				// Store individual sensor temperature for persistent logging during control run
 				if (instance->controlRun)
 				{
-					time_t current_raw_time = time(0);
-					instance->sensorTempLogs[key][current_raw_time] = sensor->lastTemp;
+					// Individual sensor logging removed - will use database instead
 				}
 			}
 		}
@@ -2246,26 +2244,7 @@ void BrewEngine::readLoop(void *arg)
 		{
 			time_t current_raw_time = time(0);
 			
-			// Store Control/Average temperature in the same system as individual sensors
-			// Use a special sensor ID for the average (0xFFFFFFFFFFFFFFFF)
-			uint64_t avgSensorId = 0xFFFFFFFFFFFFFFFF;
-			instance->sensorTempLogs[avgSensorId][current_raw_time] = avg;
-			
-			// Limit memory usage by keeping only the last 300 data points per sensor (5 minutes at 1 second intervals)
-			const size_t MAX_DATA_POINTS = 300;
-			for (auto &[sensorId, sensorLog] : instance->sensorTempLogs)
-			{
-				if (sensorLog.size() > MAX_DATA_POINTS)
-				{
-					// Remove oldest entries
-					auto it = sensorLog.begin();
-					size_t toRemove = sensorLog.size() - MAX_DATA_POINTS;
-					for (size_t i = 0; i < toRemove; ++i)
-					{
-						it = sensorLog.erase(it);
-					}
-				}
-			}
+			// Temperature logging removed - will use database instead
 			
 			// Add statistics data point every 6 cycles to reduce overhead
 			it++;
@@ -2833,79 +2812,7 @@ string BrewEngine::processCommand(const string &payLoad)
 			jCurrentTemps.push_back(jCurrentTemp);
 		}
 
-		// Individual sensor temperature logs for persistent storage (including Control/Average)
-		json jSensorTempLogs = json::array({});
-		size_t totalDataPoints = 0;
-		for (auto const &[sensorId, sensorLog] : this->sensorTempLogs)
-		{
-			totalDataPoints += sensorLog.size();
-		}
-		ESP_LOGI(TAG, "Serializing %zu sensors with %zu total data points", this->sensorTempLogs.size(), totalDataPoints);
-		
-		// Emergency memory cleanup if free heap is too low
-		size_t freeHeap = esp_get_free_heap_size();
-		const size_t MIN_HEAP_THRESHOLD = 50000; // 50KB minimum free heap
-		if (freeHeap < MIN_HEAP_THRESHOLD) {
-			ESP_LOGW(TAG, "Low memory detected (%lu bytes), performing emergency cleanup", freeHeap);
-			const size_t EMERGENCY_MAX_DATA_POINTS = 60; // Reduce to 1 minute per sensor
-			for (auto &[sensorId, sensorLog] : this->sensorTempLogs) {
-				if (sensorLog.size() > EMERGENCY_MAX_DATA_POINTS) {
-					auto it = sensorLog.begin();
-					size_t toRemove = sensorLog.size() - EMERGENCY_MAX_DATA_POINTS;
-					for (size_t i = 0; i < toRemove; ++i) {
-						it = sensorLog.erase(it);
-					}
-				}
-			}
-			ESP_LOGI(TAG, "Emergency cleanup completed, free heap now: %lu bytes", esp_get_free_heap_size());
-		}
-		
-		for (auto const &[sensorId, sensorLog] : this->sensorTempLogs)
-		{
-			json jSensorTempLog;
-			jSensorTempLog["sensor"] = to_string(sensorId);
-			
-			json jTemps = json::array({});
-			
-			// If we have a last date we only need to send the log increment
-			if (!data["lastDate"].is_null() && data["lastDate"].is_number())
-			{
-				time_t lastClientDate = (time_t)data["lastDate"];
-				
-				// Send only new temperature readings since last client date
-				for (auto iter = sensorLog.rbegin(); iter != sensorLog.rend(); ++iter)
-				{
-					if (iter->first > lastClientDate)
-					{
-						json jTempItem;
-						jTempItem["time"] = iter->first;
-						jTempItem["temp"] = (double)((int)(iter->second * 10)) / 10; // round to 1 digit
-						jTemps.push_back(jTempItem);
-					}
-					else
-					{
-						break;
-					}
-				}
-			}
-			else
-			{
-				// Send only the last 30 temperature readings for this sensor (30 seconds) to prevent memory issues
-				size_t maxDataPointsToSend = 30;
-				size_t pointsSent = 0;
-				for (auto iter = sensorLog.rbegin(); iter != sensorLog.rend() && pointsSent < maxDataPointsToSend; ++iter, ++pointsSent)
-				{
-					json jTempItem;
-					jTempItem["time"] = iter->first;
-					jTempItem["temp"] = (double)((int)(iter->second * 10)) / 10; // round to 1 digit
-					jTemps.push_back(jTempItem);
-				}
-			}
-			
-			jSensorTempLog["temps"] = jTemps;
-			jSensorTempLogs.push_back(jSensorTempLog);
-		}
-
+		// sensorTempLogs removed - will fetch from database instead to save memory
 		resultData = {
 			{"temp", (double)((int)(this->temperature * 10)) / 10}, // round float to 1 digit for display
 			{"temps", jCurrentTemps},
@@ -2917,7 +2824,7 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"stirStatus", this->stirStatusText},
 			{"lastLogDateTime", lastLogDateTime},
 			{"tempLog", json::array({})}, // Empty array for backward compatibility
-			{"sensorTempLogs", jSensorTempLogs},
+			{"sensorTempLogs", json::array({})}, // Empty array - will fetch from database instead
 			{"runningVersion", this->runningVersion},
 			{"inOverTime", this->inOverTime},
 			{"boostStatus", this->boostStatus},
