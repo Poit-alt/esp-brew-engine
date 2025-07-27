@@ -36,6 +36,7 @@ void BrewEngine::Init()
 	}
 
 	this->initHeaters();
+	ESP_LOGI(TAG, "Heaters initialization completed, proceeding to stir pin");
 
 	if (this->stir_PIN == GPIO_NUM_NC || this->stir_PIN >= GPIO_NUM_MAX)
 	{
@@ -89,14 +90,45 @@ void BrewEngine::Init()
 
 void BrewEngine::initHeaters()
 {
+	ESP_LOGI(TAG, "Initializing %d heaters", this->heaters.size());
+	
 	for (auto const &heater : this->heaters)
 	{
-		ESP_LOGI(TAG, "Heater %s Configured", heater->name.c_str());
+		ESP_LOGI(TAG, "Configuring heater %s on pin %d", heater->name.c_str(), heater->pinNr);
 
-		gpio_reset_pin(heater->pinNr);
-		gpio_set_direction(heater->pinNr, GPIO_MODE_OUTPUT);
-		gpio_set_level(heater->pinNr, this->gpioLow);
+		// Validate GPIO pin for ESP32-S3
+		if (heater->pinNr < 0 || heater->pinNr >= GPIO_NUM_MAX || 
+			!GPIO_IS_VALID_OUTPUT_GPIO(heater->pinNr)) {
+			ESP_LOGE(TAG, "Invalid GPIO pin %d for heater %s, skipping", heater->pinNr, heater->name.c_str());
+			continue;
+		}
+
+		esp_err_t err = gpio_reset_pin(heater->pinNr);
+		if (err != ESP_OK) {
+			ESP_LOGE(TAG, "Failed to reset GPIO %d for heater %s: %s", heater->pinNr, heater->name.c_str(), esp_err_to_name(err));
+			continue;
+		}
+		ESP_LOGI(TAG, "GPIO reset done for %s", heater->name.c_str());
+		
+		err = gpio_set_direction(heater->pinNr, GPIO_MODE_OUTPUT);
+		if (err != ESP_OK) {
+			ESP_LOGE(TAG, "Failed to set GPIO direction %d for heater %s: %s", heater->pinNr, heater->name.c_str(), esp_err_to_name(err));
+			continue;
+		}
+		ESP_LOGI(TAG, "GPIO direction set for %s", heater->name.c_str());
+		
+		err = gpio_set_level(heater->pinNr, this->gpioLow);
+		if (err != ESP_OK) {
+			ESP_LOGE(TAG, "Failed to set GPIO level %d for heater %s: %s", heater->pinNr, heater->name.c_str(), esp_err_to_name(err));
+			continue;
+		}
+		ESP_LOGI(TAG, "Heater %s Configured", heater->name.c_str());
+		
+		// Yield to prevent watchdog timeout during initialization
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
+	
+	ESP_LOGI(TAG, "All heaters initialized successfully");
 }
 
 void BrewEngine::readSystemSettings()
@@ -111,9 +143,9 @@ void BrewEngine::readSystemSettings()
 
 	// RTD sensor settings - use shorter keys to avoid NVS limits
 	this->rtdSensorsEnabled = this->settingsManager->Read("rtdEnabled", false);
-	this->spi_mosi_pin = (gpio_num_t)this->settingsManager->Read("spiMosi", (uint16_t)23);
-	this->spi_miso_pin = (gpio_num_t)this->settingsManager->Read("spiMiso", (uint16_t)19);
-	this->spi_clk_pin = (gpio_num_t)this->settingsManager->Read("spiClk", (uint16_t)18);
+	this->spi_mosi_pin = (gpio_num_t)this->settingsManager->Read("spiMosi", (uint16_t)20);
+	this->spi_miso_pin = (gpio_num_t)this->settingsManager->Read("spiMiso", (uint16_t)21);
+	this->spi_clk_pin = (gpio_num_t)this->settingsManager->Read("spiClk", (uint16_t)47);
 	this->spi_cs_pin = (gpio_num_t)this->settingsManager->Read("spiCs", (uint16_t)5);
 	this->rtdSensorCount = 0;
 
@@ -1260,16 +1292,30 @@ void BrewEngine::detectOnewireTemperatureSensors()
 	esp_err_t search_result = ESP_OK;
 
 	// create 1-wire device iterator, which is used for device search
-	ESP_ERROR_CHECK(onewire_new_device_iter(this->obh, &iter));
+	esp_err_t iter_result = onewire_new_device_iter(this->obh, &iter);
+	if (iter_result != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to create OneWire device iterator: %s", esp_err_to_name(iter_result));
+		ESP_LOGI(TAG, "OneWire sensors not available, continuing without them");
+		this->skipTempLoop = false;
+		return;
+	}
 	ESP_LOGI(TAG, "Device iterator created, start searching...");
 
 	int i = 0;
+	int max_attempts = 10; // Limit search attempts to prevent infinite loop
+	int attempts = 0;
 	do
 	{
 
 		onewire_device_t next_onewire_device = {};
 
 		search_result = onewire_device_iter_get_next(iter, &next_onewire_device);
+		attempts++;
+		
+		// Add watchdog reset to prevent timeout during search
+		if (attempts % 3 == 0) {
+			vTaskDelay(pdMS_TO_TICKS(10));
+		}
 		if (search_result == ESP_OK)
 		{ // found a new device, let's check if we can upgrade it to a DS18B20
 			ds18b20_config_t ds_cfg = {};
@@ -1327,9 +1373,16 @@ void BrewEngine::detectOnewireTemperatureSensors()
 				ESP_LOGI(TAG, "Found an unknown device, address: %016llX", next_onewire_device.address);
 			}
 		}
-	} while (search_result != ESP_ERR_NOT_FOUND);
+	} while (search_result != ESP_ERR_NOT_FOUND && attempts < max_attempts);
 
-	ESP_ERROR_CHECK(onewire_del_device_iter(iter));
+	if (attempts >= max_attempts) {
+		ESP_LOGW(TAG, "OneWire search reached maximum attempts (%d), stopping to prevent watchdog timeout", max_attempts);
+	}
+
+	esp_err_t del_result = onewire_del_device_iter(iter);
+	if (del_result != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to delete OneWire device iterator: %s", esp_err_to_name(del_result));
+	}
 	ESP_LOGI(TAG, "Searching done, %d DS18B20 device(s) found", this->sensors.size());
 
 	this->skipTempLoop = false;
