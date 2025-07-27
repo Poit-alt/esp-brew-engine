@@ -6,7 +6,7 @@ import { IMashSchedule } from "@/interfaces/IMashSchedule";
 import { IMashStep, defaultMashStep } from "@/interfaces/IMashStep";
 import { INotification, defaultNotification } from "@/interfaces/INotification";
 import { useAppStore } from "@/store/app";
-import { mdiDelete, mdiPencil } from "@mdi/js";
+import { mdiDelete, mdiPencil, mdiInformationOutline } from "@mdi/js";
 import { computed, inject, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 const { t } = useI18n({ useScope: "global" });
@@ -133,7 +133,20 @@ const deleteSchedule = async () => {
           <v-text-field v-model="currentName" :label='t("mashSchedules.name")' />
         </v-col>
         <v-col cols="12" md="3">
-          <v-switch v-model="currentBoil" :label='t("mashSchedules.is_boil")' color="red" />
+          <div class="d-flex align-center">
+            <v-switch v-model="currentBoil" :label='t("mashSchedules.is_boil")' color="red" />
+            <v-tooltip location="top" max-width="300">
+              <template v-slot:activator="{ props }">
+                <v-icon 
+                  v-bind="props" 
+                  :icon="mdiInformationOutline" 
+                  size="small" 
+                  class="ml-2 text-grey-lighten-1"
+                />
+              </template>
+              <span v-html="t('mashSchedules.is_boil_info')"></span>
+            </v-tooltip>
+          </div>
         </v-col>
         <v-col cols="12" md="3">
           <v-btn color="success" class="mt-4 mr-2" @click="saveSchedule"> {{ t('general.save') }} </v-btn>

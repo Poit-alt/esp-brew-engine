@@ -148,6 +148,7 @@
   "mashSchedules": {
     "name": "Naam",
     "is_boil": "Is kookschema",
+    "is_boil_info": "Aanvinken voor kookschema's (100°C+).<br>Gebruikt kook-PID-instellingen en kookverwarmers.<br><br>Uitvinken voor maischschema's (lagere temperaturen).<br>Gebruikt maisch-PID-instellingen.<br><br>Indien uitgevinkt, detecteert systeem automatisch kookmodus bij 100°C.",
     "mashSchedule": "Schema maishen/koken",
     "max_schedules_reached": "Er kunnen slechts {0} worden opgeslagen!",
     "steps": "Stappen",

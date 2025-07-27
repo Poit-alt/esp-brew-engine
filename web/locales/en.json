@@ -149,6 +149,7 @@
   "mashSchedules": {
     "name": "Name",
     "is_boil": "Is Boil Schedule",
+    "is_boil_info": "Check for boiling schedules (100°C/212°F+).<br>Uses boil PID settings and heaters configured for boiling.<br><br>Uncheck for mashing schedules (lower temps).<br>Uses mash PID settings.<br><br>If unchecked, system auto-detects boil mode at 100°C/212°F.",
     "mashSchedule": "Mash/Boil Schedule",
     "max_schedules_reached": "Only {0} can be saved!",
     "steps": "Steps",
