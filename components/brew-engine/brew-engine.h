@@ -12,6 +12,7 @@
 
 #include "esp_log.h"
 #include <esp_http_server.h>
+#include "esp_http_client.h"
 #include "esp_ota_ops.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
@@ -134,7 +135,7 @@ private:
     std::optional<float> overrideTargetTemperature = std::nullopt; // manualy overwritten temp
     std::map<uint64_t, float> currentTemperatures;                 // map with last temp for each sensor
     std::map<time_t, int8_t> tempLog;                              // integer log of averages, only used to show running history on web
-    std::map<uint64_t, std::map<time_t, float>> sensorTempLogs;    // individual sensor temperature logs for persistent storage
+    // sensorTempLogs removed - will fetch from database instead to save memory
 
     // pid
     uint8_t pidOutput = 0;
@@ -204,6 +205,22 @@ private:
     esp_mqtt_client_handle_t mqttClient;
     string mqttTopic = "";
     string mqttTopicLog = "";
+
+    // InfluxDB
+    bool influxdbEnabled = false;
+    string influxdbUrl = "";
+    string influxdbToken = "";
+    string influxdbOrg = "";
+    string influxdbBucket = "";
+    uint16_t influxdbSendInterval = 10; // seconds between database writes
+    system_clock::time_point lastInfluxDBSend;
+    uint32_t currentSessionId = 0;
+    void initInfluxDB();
+    string escapeInfluxDBTagValue(const string &value);
+    void sendToInfluxDB(const string &measurement, const string &fields, const string &tags = "");
+    string queryInfluxDB(const string &query);
+    json getInfluxDBStatistics(const json &requestData);
+    json getInfluxDBSessionData(const json &requestData);
 
     // stirring/pumping
     TaskHandle_t stirLoopHandle = NULL;
