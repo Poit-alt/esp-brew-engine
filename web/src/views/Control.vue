@@ -470,6 +470,9 @@ const getData = async () => {
   const apiResult = await webConn?.doPostRequest(requestData);
 
   if (apiResult === undefined || apiResult.success === false) {
+    console.warn("Failed to get data, preserving existing chart data");
+    // Don't clear the chart data when API fails - just skip this update
+    // This prevents the graph from disappearing in Access Point mode
     return;
   }
 
@@ -776,9 +779,11 @@ onMounted(() => {
   // atm only used to render te schedule at the current time
   setStartDateNow();
 
+  // Use longer polling interval (5s) to reduce network load in Access Point mode
+  // This helps prevent connection timeouts that cause the graph to disappear
   intervalId.value = setInterval(() => {
     getData();
-  }, 3000);
+  }, 5000);
 
   initChart();
 });

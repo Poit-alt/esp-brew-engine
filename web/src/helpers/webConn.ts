@@ -20,22 +20,28 @@ export default class WebConn {
         headers: {
           "Content-Type": "application/json",
         },
+        // Add timeout for Access Point mode compatibility
+        signal: AbortSignal.timeout(5000),
         // redirect: "follow", // manual, *follow, error
         // referrerPolicy: "no-referrer", // no-referrer, *no-referrer-when-downgrade, origin, origin-when-cross-origin, same-origin, strict-origin, strict-origin-when-cross-origin, unsafe-url
         body: JSON.stringify(data), // body data type must match "Content-Type" header
       })
         .then((result) => {
+          if (!result.ok) {
+            throw new Error(`HTTP ${result.status}: ${result.statusText}`);
+          }
           const apiResult = result.json();
           resolve(apiResult);
         })
         .catch((error) => {
-          console.error(error);
+          console.warn("API request failed:", error.message || error);
           const apiResult: IApiResult = {
             success: false,
             data: null,
-            message: error,
+            message: error.message || error.toString(),
           };
-          reject(apiResult);
+          // Resolve with failed result instead of rejecting to prevent unhandled promise rejections
+          resolve(apiResult);
         });
     });
   }
