@@ -77,7 +77,7 @@ void BrewEngine::Init()
 
 	this->initMqtt();
 
-	this->initInfluxDB();
+	this->initFirebase();
 
 	this->statisticsManager->Init();
 
@@ -159,12 +159,36 @@ void BrewEngine::readSystemSettings()
 	// mqtt
 	this->mqttUri = this->settingsManager->Read("mqttUri", (string)CONFIG_MQTT_URI);
 
-	// InfluxDB
-	this->influxdbUrl = this->settingsManager->Read("influxdbUrl", (string)"");
-	this->influxdbToken = this->settingsManager->Read("influxdbToken", (string)"");
-	this->influxdbOrg = this->settingsManager->Read("influxdbOrg", (string)"");
-	this->influxdbBucket = this->settingsManager->Read("influxdbBucket", (string)"");
-	this->influxdbSendInterval = this->settingsManager->Read("influxdbInt", (uint16_t)10);
+	// Firebase (using short key names due to NVS 15-char limit)
+	// Migrate from old long key names if they exist
+	string oldFirebaseUrl = this->settingsManager->Read("firebaseUrl", (string)"");
+	if (!oldFirebaseUrl.empty()) {
+		ESP_LOGI(TAG, "Migrating firebaseUrl to fbUrl");
+		this->settingsManager->Write("fbUrl", oldFirebaseUrl);
+		// Note: We don't delete the old key to avoid issues
+	}
+	
+	this->firebaseUrl = this->settingsManager->Read("fbUrl", (string)"");
+	
+	// Trim any whitespace from loaded Firebase URL
+	if (!this->firebaseUrl.empty()) {
+		size_t start = this->firebaseUrl.find_first_not_of(" \t\n\r");
+		if (start != string::npos) {
+			size_t end = this->firebaseUrl.find_last_not_of(" \t\n\r");
+			this->firebaseUrl = this->firebaseUrl.substr(start, end - start + 1);
+		} else {
+			this->firebaseUrl.clear(); // String contains only whitespace
+		}
+	}
+	
+	ESP_LOGI(TAG, "Loaded Firebase URL (%d chars): '%s'", this->firebaseUrl.length(), this->firebaseUrl.c_str());
+	this->firebaseApiKey = this->settingsManager->Read("fbApiKey", (string)"");
+	this->firebaseAuthToken = this->settingsManager->Read("fbAuthToken", (string)"");
+	this->firebaseEmail = this->settingsManager->Read("fbEmail", (string)"");
+	this->firebasePassword = this->settingsManager->Read("fbPassword", (string)"");
+	this->firebaseAuthMethod = this->settingsManager->Read("fbAuthMethod", (string)"email");
+	this->firebaseSendInterval = this->settingsManager->Read("fbSendInt", (uint16_t)10);
+	this->firebaseDatabaseEnabled = this->settingsManager->Read("fbDbEnabled", true);
 
 	// temperature scale
 	uint8_t defaultConfigScale = 0; // default to Celsius
@@ -212,35 +236,108 @@ void BrewEngine::saveSystemSettingsJson(const json &config)
 		this->mqttUri = config["mqttUri"];
 	}
 	
-	// InfluxDB configuration
-	if (!config["influxdbUrl"].is_null() && config["influxdbUrl"].is_string())
+	// Firebase configuration (using short key names due to NVS 15-char limit)
+	if (!config["firebaseUrl"].is_null() && config["firebaseUrl"].is_string())
 	{
-		this->settingsManager->Write("influxdbUrl", (string)config["influxdbUrl"]);
-		this->influxdbUrl = config["influxdbUrl"];
+		string url = (string)config["firebaseUrl"];
+		// Trim whitespace safely
+		size_t start = url.find_first_not_of(" \t\n\r");
+		if (start != string::npos) {
+			size_t end = url.find_last_not_of(" \t\n\r");
+			url = url.substr(start, end - start + 1);
+		} else {
+			url.clear(); // String contains only whitespace
+		}
+		this->settingsManager->Write("fbUrl", url);
+		this->firebaseUrl = url;
+		ESP_LOGI(TAG, "Saved Firebase URL (%d chars): '%s'", url.length(), url.c_str());
 	}
-	if (!config["influxdbToken"].is_null() && config["influxdbToken"].is_string())
+	if (!config["firebaseApiKey"].is_null() && config["firebaseApiKey"].is_string())
 	{
-		this->settingsManager->Write("influxdbToken", (string)config["influxdbToken"]);
-		this->influxdbToken = config["influxdbToken"];
+		string apiKey = (string)config["firebaseApiKey"];
+		// Trim whitespace safely
+		size_t start = apiKey.find_first_not_of(" \t\n\r");
+		if (start != string::npos) {
+			size_t end = apiKey.find_last_not_of(" \t\n\r");
+			apiKey = apiKey.substr(start, end - start + 1);
+		} else {
+			apiKey.clear();
+		}
+		this->settingsManager->Write("fbApiKey", apiKey);
+		this->firebaseApiKey = apiKey;
 	}
-	if (!config["influxdbOrg"].is_null() && config["influxdbOrg"].is_string())
+	if (!config["firebaseAuthToken"].is_null() && config["firebaseAuthToken"].is_string())
 	{
-		this->settingsManager->Write("influxdbOrg", (string)config["influxdbOrg"]);
-		this->influxdbOrg = config["influxdbOrg"];
+		string authToken = (string)config["firebaseAuthToken"];
+		// Trim whitespace safely
+		size_t start = authToken.find_first_not_of(" \t\n\r");
+		if (start != string::npos) {
+			size_t end = authToken.find_last_not_of(" \t\n\r");
+			authToken = authToken.substr(start, end - start + 1);
+		} else {
+			authToken.clear();
+		}
+		this->settingsManager->Write("fbAuthToken", authToken);
+		this->firebaseAuthToken = authToken;
 	}
-	if (!config["influxdbBucket"].is_null() && config["influxdbBucket"].is_string())
+	if (!config["firebaseEmail"].is_null() && config["firebaseEmail"].is_string())
 	{
-		this->settingsManager->Write("influxdbBucket", (string)config["influxdbBucket"]);
-		this->influxdbBucket = config["influxdbBucket"];
+		string email = (string)config["firebaseEmail"];
+		// Trim whitespace safely
+		size_t start = email.find_first_not_of(" \t\n\r");
+		if (start != string::npos) {
+			size_t end = email.find_last_not_of(" \t\n\r");
+			email = email.substr(start, end - start + 1);
+		} else {
+			email.clear();
+		}
+		this->settingsManager->Write("fbEmail", email);
+		this->firebaseEmail = email;
 	}
-	if (!config["influxdbSendInterval"].is_null() && config["influxdbSendInterval"].is_number())
+	if (!config["firebasePassword"].is_null() && config["firebasePassword"].is_string())
 	{
-		uint16_t interval = config["influxdbSendInterval"];
+		string password = (string)config["firebasePassword"];
+		// Trim whitespace safely
+		size_t start = password.find_first_not_of(" \t\n\r");
+		if (start != string::npos) {
+			size_t end = password.find_last_not_of(" \t\n\r");
+			password = password.substr(start, end - start + 1);
+		} else {
+			password.clear();
+		}
+		this->settingsManager->Write("fbPassword", password);
+		this->firebasePassword = password;
+	}
+	if (!config["firebaseAuthMethod"].is_null() && config["firebaseAuthMethod"].is_string())
+	{
+		this->settingsManager->Write("fbAuthMethod", (string)config["firebaseAuthMethod"]);
+		this->firebaseAuthMethod = config["firebaseAuthMethod"];
+	}
+	if (!config["firebaseSendInterval"].is_null() && config["firebaseSendInterval"].is_number())
+	{
+		uint16_t interval = config["firebaseSendInterval"];
 		// Validate interval is between 1 and 300 seconds
 		if (interval >= 1 && interval <= 300)
 		{
-			this->settingsManager->Write("influxdbInt", interval);
-			this->influxdbSendInterval = interval;
+			this->settingsManager->Write("fbSendInt", interval);
+			this->firebaseSendInterval = interval;
+		}
+	}
+	if (!config["firebaseDatabaseEnabled"].is_null() && config["firebaseDatabaseEnabled"].is_boolean())
+	{
+		this->settingsManager->Write("fbDbEnabled", (bool)config["firebaseDatabaseEnabled"]);
+		this->firebaseDatabaseEnabled = config["firebaseDatabaseEnabled"];
+	}
+	
+	// Auto-disable Firebase database if in AP mode (no internet access)
+	if (this->GetWifiSettingsJson) {
+		json wifiSettings = this->GetWifiSettingsJson();
+		if (!wifiSettings["enableAP"].is_null() && wifiSettings["enableAP"].is_boolean() && wifiSettings["enableAP"] == true) {
+			if (this->firebaseDatabaseEnabled) {
+				ESP_LOGW(TAG, "Auto-disabling Firebase database logging: device is in AP mode (no internet access)");
+				this->firebaseDatabaseEnabled = false;
+				this->settingsManager->Write("fbDbEnabled", false);
+			}
 		}
 	}
 	
@@ -883,384 +980,937 @@ void BrewEngine::initMqtt()
 	ESP_LOGI(TAG, "initMqtt: Done");
 }
 
-void BrewEngine::initInfluxDB()
+void BrewEngine::initFirebase()
 {
-	// return if no URL is configured
-	if (this->influxdbUrl.empty() || this->influxdbToken.empty() || this->influxdbOrg.empty() || this->influxdbBucket.empty())
+	// Check if Firebase database is enabled
+	if (!this->firebaseDatabaseEnabled)
 	{
-		ESP_LOGI(TAG, "InfluxDB not configured, skipping initialization");
+		ESP_LOGI(TAG, "Firebase database logging disabled, skipping initialization");
+		this->firebaseEnabled = false;
+		return;
+	}
+	
+	// return if no URL is configured
+	if (this->firebaseUrl.empty())
+	{
+		ESP_LOGI(TAG, "Firebase not configured, skipping initialization");
+		return;
+	}
+	
+	// Firebase API Key is required for both authentication methods
+	if (this->firebaseApiKey.empty()) {
+		ESP_LOGE(TAG, "Firebase API Key not configured - Firebase disabled");
+		this->firebaseEnabled = false;
+		return;
+	}
+	
+	// Check if authentication credentials are configured based on selected method
+	if (this->firebaseAuthMethod == "email") {
+		if (this->firebaseEmail.empty() || this->firebasePassword.empty()) {
+			ESP_LOGE(TAG, "Firebase email/password not configured - Firebase disabled");
+			this->firebaseEnabled = false;
+			return;
+		}
+		ESP_LOGI(TAG, "Firebase email/password authentication configured");
+	} else if (this->firebaseAuthMethod == "token") {
+		if (this->firebaseAuthToken.empty()) {
+			ESP_LOGE(TAG, "Firebase Auth Token not configured - Firebase disabled");
+			this->firebaseEnabled = false;
+			return;
+		}
+		ESP_LOGI(TAG, "Firebase API Key/Custom Token authentication configured");
+	} else {
+		ESP_LOGE(TAG, "Invalid Firebase authentication method: %s - Firebase disabled", this->firebaseAuthMethod.c_str());
+		this->firebaseEnabled = false;
 		return;
 	}
 
-	ESP_LOGI(TAG, "initInfluxDB: Start");
+	ESP_LOGI(TAG, "initFirebase: Start");
 	
 	// Generate a unique session ID for this boot
 	this->currentSessionId = esp_random();
 	
-	this->influxdbEnabled = true;
+	this->firebaseEnabled = true;
 	
 	// Initialize last send time to allow immediate first send
-	this->lastInfluxDBSend = system_clock::now() - seconds(this->influxdbSendInterval);
+	this->lastFirebaseSend = system_clock::now() - seconds(this->firebaseSendInterval);
 	
-	ESP_LOGI(TAG, "initInfluxDB: Done - Session ID: %lu", this->currentSessionId);
+	ESP_LOGI(TAG, "initFirebase: Done - URL: %s, Session ID: %lu", this->firebaseUrl.c_str(), this->currentSessionId);
 }
 
-string BrewEngine::escapeInfluxDBTagValue(const string &value)
+bool BrewEngine::isFirebaseTokenValid()
 {
-	// Pre-allocate with extra space for escaping
-	string escaped;
-	escaped.reserve(value.length() + 20);
-	
-	for (char c : value) {
-		if (c == ' ' || c == ',' || c == '=') {
-			escaped += '\\';
-		}
-		escaped += c;
-	}
-	return escaped;
+    if (!this->firebaseAuthenticated || this->firebaseIdToken.empty()) {
+        return false;
+    }
+    
+    time_t current_time = time(NULL);
+    return (current_time + 300) < this->firebaseTokenExpiresAt; // 5 minute buffer
 }
 
-void BrewEngine::sendToInfluxDB(const string &measurement, const string &fields, const string &tags)
+esp_err_t BrewEngine::exchangeCustomTokenForIdToken()
 {
-	if (!this->influxdbEnabled)
-	{
-		return;
-	}
-
-	// Construct InfluxDB line protocol
-	string lineProtocol = measurement;
-	
-	// Add tags if provided
-	if (!tags.empty())
-	{
-		lineProtocol += "," + tags;
-	}
-	
-	// Add default tags
-	lineProtocol += ",host=" + this->Hostname;
-	lineProtocol += ",session_id=" + to_string(this->currentSessionId);
-	
-	// Add fields and timestamp
-	lineProtocol += " " + fields;
-	lineProtocol += " " + to_string(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
-	
-	ESP_LOGD(TAG, "InfluxDB line: %s", lineProtocol.c_str());
-	
-	// Configure HTTP client with static buffers
-	static char urlBuffer[512];
-	static char authBuffer[256];
-	
-	snprintf(urlBuffer, sizeof(urlBuffer), "%s/api/v2/write?org=%s&bucket=%s", 
-		this->influxdbUrl.c_str(), this->influxdbOrg.c_str(), this->influxdbBucket.c_str());
-	snprintf(authBuffer, sizeof(authBuffer), "Bearer %s", this->influxdbToken.c_str());
-	
-	ESP_LOGI(TAG, "InfluxDB URL: %s", urlBuffer);
-	ESP_LOGI(TAG, "InfluxDB Token length: %d", this->influxdbToken.length());
-	
-	esp_http_client_config_t config = {};
-	config.url = urlBuffer;
-	config.method = HTTP_METHOD_POST;
-	config.timeout_ms = 5000;
-	config.disable_auto_redirect = true;
-	
-	esp_http_client_handle_t client = esp_http_client_init(&config);
-	if (client == NULL) {
-		ESP_LOGE(TAG, "Failed to initialize HTTP client for InfluxDB");
-		return;
-	}
-	
-	// Set headers - try setting both ways
-	esp_http_client_set_header(client, "Content-Type", "text/plain");
-	esp_http_client_set_header(client, "Accept", "*/*");
-	
-	// Set authorization header after client init
-	esp_err_t header_err = esp_http_client_set_header(client, "authorization", authBuffer);
-	ESP_LOGI(TAG, "Set authorization header (lowercase) result: %s", esp_err_to_name(header_err));
-	
-	// Also try uppercase
-	header_err = esp_http_client_set_header(client, "Authorization", authBuffer);
-	ESP_LOGI(TAG, "Set Authorization header (uppercase) result: %s", esp_err_to_name(header_err));
-	
-	// Set POST data
-	ESP_LOGI(TAG, "InfluxDB data: %s", lineProtocol.c_str());
-	esp_http_client_set_post_field(client, lineProtocol.c_str(), lineProtocol.length());
-	
-	// Perform request
-	esp_err_t err = esp_http_client_perform(client);
-	
-	if (err == ESP_OK)
-	{
-		int status_code = esp_http_client_get_status_code(client);
-		if (status_code == 204)
-		{
-			ESP_LOGI(TAG, "InfluxDB write successful");
-		}
-		else
-		{
-			// Get response body for error details
-			int content_length = esp_http_client_get_content_length(client);
-			if (content_length > 0 && content_length < 1024) {
-				char response_buffer[1024];
-				int data_read = esp_http_client_read_response(client, response_buffer, sizeof(response_buffer) - 1);
-				if (data_read > 0) {
-					response_buffer[data_read] = '\0';
-					ESP_LOGW(TAG, "InfluxDB error response: %s", response_buffer);
-				}
-			}
-			ESP_LOGW(TAG, "InfluxDB write failed with status: %d", status_code);
-		}
-	}
-	else
-	{
-		ESP_LOGE(TAG, "InfluxDB HTTP request failed: %s", esp_err_to_name(err));
-	}
-	
-	esp_http_client_cleanup(client);
+    // Validate credentials are configured
+    if (this->firebaseApiKey.empty()) {
+        ESP_LOGE(TAG, "Firebase API Key not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (this->firebaseAuthToken.empty()) {
+        ESP_LOGE(TAG, "Firebase Auth Token not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    ESP_LOGI(TAG, "Firebase API Key length: %d", this->firebaseApiKey.length());
+    ESP_LOGI(TAG, "Firebase Auth Token length: %d", this->firebaseAuthToken.length());
+    
+    char url[2200];
+    char post_data[1024];
+    char response_buffer[2048];
+    
+    memset(response_buffer, 0, sizeof(response_buffer));
+    
+    snprintf(url, sizeof(url), "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=%s", this->firebaseApiKey.c_str());
+    
+    cJSON *json = cJSON_CreateObject();
+    cJSON *token = cJSON_CreateString(this->firebaseAuthToken.c_str());
+    cJSON *return_secure_token = cJSON_CreateBool(true);
+    
+    cJSON_AddItemToObject(json, "token", token);
+    cJSON_AddItemToObject(json, "returnSecureToken", return_secure_token);
+    
+    char *json_string = cJSON_Print(json);
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to create auth JSON");
+        cJSON_Delete(json);
+        return ESP_ERR_NO_MEM;
+    }
+    strcpy(post_data, json_string);
+    
+    ESP_LOGI(TAG, "Authenticating with Firebase...");
+    ESP_LOGI(TAG, "Auth URL: %s", url);
+    ESP_LOGI(TAG, "Auth payload: %s", post_data);
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.timeout_ms = 10000;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client for auth");
+        free(json_string);
+        cJSON_Delete(json);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_err_t set_field_err = esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    if (set_field_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set POST field for auth: %s", esp_err_to_name(set_field_err));
+        esp_http_client_cleanup(client);
+        free(json_string);
+        cJSON_Delete(json);
+        return set_field_err;
+    }
+    
+    esp_err_t err = esp_http_client_open(client, strlen(post_data));
+    if (err == ESP_OK) {
+        int wlen = esp_http_client_write(client, post_data, strlen(post_data));
+        ESP_LOGI(TAG, "Wrote %d bytes to auth request", wlen);
+        
+        int content_length = esp_http_client_fetch_headers(client);
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Auth response status: %d, content_length: %d", status_code, content_length);
+        
+        int total_read = 0;
+        if (content_length > 0) {
+            total_read = esp_http_client_read(client, response_buffer, content_length);
+        } else {
+            // Handle chunked response
+            int data_read;
+            while ((data_read = esp_http_client_read(client, response_buffer + total_read, 2047 - total_read)) > 0) {
+                total_read += data_read;
+                if (total_read >= 2047) break;
+            }
+        }
+        response_buffer[total_read] = '\0';
+        ESP_LOGI(TAG, "Auth response (%d bytes): %s", total_read, response_buffer);
+        
+        esp_http_client_close(client);
+        
+        if (status_code == 200) {
+            cJSON *response_json = cJSON_Parse(response_buffer);
+            if (response_json != NULL) {
+                cJSON *id_token = cJSON_GetObjectItem(response_json, "idToken");
+                cJSON *expires_in = cJSON_GetObjectItem(response_json, "expiresIn");
+                
+                if (cJSON_IsString(id_token) && id_token->valuestring != NULL) {
+                    this->firebaseIdToken = id_token->valuestring;
+                    
+                    int expires_seconds = 3600; // default 1 hour
+                    if (cJSON_IsString(expires_in) && expires_in->valuestring != NULL) {
+                        expires_seconds = atoi(expires_in->valuestring);
+                    }
+                    this->firebaseTokenExpiresAt = time(NULL) + expires_seconds;
+                    this->firebaseAuthenticated = true;
+                    
+                    ESP_LOGI(TAG, "✓ Firebase authentication successful (expires in %d seconds)", expires_seconds);
+                    err = ESP_OK;
+                } else {
+                    ESP_LOGE(TAG, "Invalid auth response: missing idToken");
+                    err = ESP_FAIL;
+                }
+                cJSON_Delete(response_json);
+            } else {
+                ESP_LOGE(TAG, "Failed to parse auth response");
+                err = ESP_FAIL;
+            }
+        } else {
+            ESP_LOGE(TAG, "Authentication failed with status %d", status_code);
+            ESP_LOGE(TAG, "Auth response: %s", response_buffer);
+            
+            // Check for specific error types and provide helpful messages
+            cJSON *error_json = cJSON_Parse(response_buffer);
+            if (error_json != NULL) {
+                cJSON *error_obj = cJSON_GetObjectItem(error_json, "error");
+                if (error_obj != NULL) {
+                    cJSON *message = cJSON_GetObjectItem(error_obj, "message");
+                    if (cJSON_IsString(message)) {
+                        if (strcmp(message->valuestring, "INVALID_CUSTOM_TOKEN") == 0) {
+                            ESP_LOGE(TAG, "🔑 INVALID_CUSTOM_TOKEN: The Firebase custom token has expired or is malformed.");
+                            ESP_LOGE(TAG, "   Please generate a new custom token from your Firebase service account.");
+                            ESP_LOGE(TAG, "   Custom tokens typically expire after 1 hour.");
+                        } else if (strcmp(message->valuestring, "INVALID_API_KEY") == 0) {
+                            ESP_LOGE(TAG, "🔑 INVALID_API_KEY: The Firebase Web API Key is incorrect.");
+                            ESP_LOGE(TAG, "   Check your Firebase Project Settings > Web API Key.");
+                        } else {
+                            ESP_LOGE(TAG, "🔑 Firebase Auth Error: %s", message->valuestring);
+                        }
+                    }
+                }
+                cJSON_Delete(error_json);
+            }
+            
+            this->firebaseAuthenticated = false;
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to perform auth request: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(json_string);
+    cJSON_Delete(json);
+    return err;
 }
 
-string BrewEngine::queryInfluxDB(const string &query)
+esp_err_t BrewEngine::refreshFirebaseToken()
 {
-	if (!this->influxdbEnabled)
-	{
-		return "";
-	}
-
-	ESP_LOGD(TAG, "InfluxDB query: %s", query.c_str());
-	
-	// URL encode the query
-	string encodedQuery = query;
-	// TODO: Implement proper URL encoding if needed
-	
-	// Configure HTTP client for query
-	string queryUrl = this->influxdbUrl + "/api/v2/query?org=" + this->influxdbOrg;
-	esp_http_client_config_t config = {};
-	config.url = queryUrl.c_str();
-	config.method = HTTP_METHOD_POST;
-	config.timeout_ms = 10000;
-	config.disable_auto_redirect = true;
-	
-	esp_http_client_handle_t client = esp_http_client_init(&config);
-	
-	// Set headers
-	esp_http_client_set_header(client, "Authorization", ("Bearer " + this->influxdbToken).c_str());
-	esp_http_client_set_header(client, "Content-Type", "application/vnd.flux");
-	esp_http_client_set_header(client, "Accept", "application/json");
-	
-	// Set POST data (Flux query)
-	string fluxQuery = "from(bucket:\"" + this->influxdbBucket + "\") " + query;
-	esp_http_client_set_post_field(client, fluxQuery.c_str(), fluxQuery.length());
-	
-	// Perform request
-	esp_err_t err = esp_http_client_perform(client);
-	
-	string response = "";
-	if (err == ESP_OK)
-	{
-		int status_code = esp_http_client_get_status_code(client);
-		int content_length = esp_http_client_get_content_length(client);
-		
-		if (status_code == 200 && content_length > 0)
-		{
-			char *buffer = (char *)malloc(content_length + 1);
-			if (buffer)
-			{
-				int read_length = esp_http_client_read(client, buffer, content_length);
-				if (read_length > 0)
-				{
-					buffer[read_length] = '\0';
-					response = string(buffer);
-				}
-				free(buffer);
-			}
-		}
-		else
-		{
-			ESP_LOGW(TAG, "InfluxDB query failed with status: %d", status_code);
-		}
-	}
-	else
-	{
-		ESP_LOGE(TAG, "InfluxDB query HTTP request failed: %s", esp_err_to_name(err));
-	}
-	
-	esp_http_client_cleanup(client);
-	return response;
+    if (this->firebaseRefreshToken.empty()) {
+        ESP_LOGE(TAG, "No refresh token available");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    char url[2200];
+    char post_data[1024];
+    char response_buffer[2048];
+    
+    memset(response_buffer, 0, sizeof(response_buffer));
+    
+    snprintf(url, sizeof(url), "https://securetoken.googleapis.com/v1/token?key=%s", this->firebaseApiKey.c_str());
+    
+    cJSON *json = cJSON_CreateObject();
+    cJSON *grant_type = cJSON_CreateString("refresh_token");
+    cJSON *refresh_token = cJSON_CreateString(this->firebaseRefreshToken.c_str());
+    
+    cJSON_AddItemToObject(json, "grant_type", grant_type);
+    cJSON_AddItemToObject(json, "refresh_token", refresh_token);
+    
+    char *json_string = cJSON_Print(json);
+    strncpy(post_data, json_string, sizeof(post_data) - 1);
+    post_data[sizeof(post_data) - 1] = '\0';
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+    config.timeout_ms = 10000;
+    config.event_handler = this->http_event_handler;
+    config.user_data = response_buffer;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        int content_length = esp_http_client_get_content_length(client);
+        
+        ESP_LOGI(TAG, "Token refresh response status: %d, content_length: %d", status_code, content_length);
+        
+        if (status_code == 200) {
+            cJSON *response_json = cJSON_Parse(response_buffer);
+            if (response_json != NULL) {
+                cJSON *id_token = cJSON_GetObjectItem(response_json, "id_token");
+                cJSON *refresh_token_new = cJSON_GetObjectItem(response_json, "refresh_token");
+                cJSON *expires_in = cJSON_GetObjectItem(response_json, "expires_in");
+                
+                if (cJSON_IsString(id_token) && id_token->valuestring != NULL) {
+                    this->firebaseIdToken = id_token->valuestring;
+                    
+                    if (cJSON_IsString(refresh_token_new) && refresh_token_new->valuestring != NULL) {
+                        this->firebaseRefreshToken = refresh_token_new->valuestring;
+                    }
+                    
+                    // Set expiration time (default 1 hour if not specified)
+                    int expires_seconds = 3600;
+                    if (cJSON_IsString(expires_in) && expires_in->valuestring != NULL) {
+                        expires_seconds = atoi(expires_in->valuestring);
+                    }
+                    
+                    this->firebaseTokenExpiresAt = time(NULL) + expires_seconds;
+                    this->firebaseAuthenticated = true;
+                    
+                    ESP_LOGI(TAG, "✓ Firebase token refreshed successfully (expires in %d seconds)", expires_seconds);
+                    err = ESP_OK;
+                } else {
+                    ESP_LOGE(TAG, "Invalid refresh response: missing id_token");
+                    err = ESP_FAIL;
+                }
+                cJSON_Delete(response_json);
+            } else {
+                ESP_LOGE(TAG, "Failed to parse refresh response");
+                err = ESP_FAIL;
+            }
+        } else {
+            ESP_LOGE(TAG, "Token refresh failed with status %d", status_code);
+            ESP_LOGE(TAG, "Refresh response: %s", response_buffer);
+            this->firebaseAuthenticated = false;
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to perform token refresh request: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(json_string);
+    cJSON_Delete(json);
+    return err;
 }
 
-json BrewEngine::getInfluxDBStatistics(const json &requestData)
+esp_err_t BrewEngine::authenticateWithEmailPassword()
 {
-	if (!this->influxdbEnabled)
-	{
-		// Fallback to local statistics if InfluxDB is not enabled
-		json result;
-		
-		// Get sessions
-		vector<BrewSession> sessions = this->statisticsManager->GetSessionList();
-		json jSessions = json::array();
-		for (const auto& session : sessions) {
-			json jSession;
-			jSession["sessionId"] = session.sessionId;
-			jSession["scheduleName"] = session.scheduleName;
-			jSession["startTime"] = session.startTime;
-			jSession["endTime"] = session.endTime;
-			jSession["duration"] = session.totalDuration;
-			jSession["dataPoints"] = session.dataPoints;
-			jSession["avgTemperature"] = session.avgTemperature;
-			jSession["minTemperature"] = session.minTemperature;
-			jSession["maxTemperature"] = session.maxTemperature;
-			jSession["completed"] = session.completed;
-			jSessions.push_back(jSession);
-		}
-		
-		// Get stats
-		map<string, uint32_t> stats = this->statisticsManager->GetSessionStats();
-		
-		// Get config
-		json config = {
-			{"maxSessions", this->statisticsManager->GetMaxSessions()},
-			{"currentSessionActive", this->statisticsManager->IsSessionActive()},
-			{"currentSessionId", this->statisticsManager->GetCurrentSessionId()},
-			{"currentDataPoints", this->statisticsManager->GetCurrentSessionDataPoints()}
-		};
-		
-		result["sessions"] = jSessions;
-		result["stats"] = stats;
-		result["config"] = config;
-		
-		return result;
-	}
+    if (this->firebaseEmail.empty() || this->firebasePassword.empty()) {
+        ESP_LOGE(TAG, "Email or password not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (this->firebaseApiKey.empty()) {
+        ESP_LOGE(TAG, "Firebase API Key required for email/password authentication");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    char url[2200];
+    char post_data[1024];
+    char response_buffer[2048];
+    
+    memset(response_buffer, 0, sizeof(response_buffer));
+    
+    snprintf(url, sizeof(url), "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=%s", this->firebaseApiKey.c_str());
+    
+    cJSON *json = cJSON_CreateObject();
+    cJSON *email = cJSON_CreateString(this->firebaseEmail.c_str());
+    cJSON *password = cJSON_CreateString(this->firebasePassword.c_str());
+    cJSON *return_secure_token = cJSON_CreateBool(true);
+    
+    cJSON_AddItemToObject(json, "email", email);
+    cJSON_AddItemToObject(json, "password", password);
+    cJSON_AddItemToObject(json, "returnSecureToken", return_secure_token);
+    
+    char *json_string = cJSON_Print(json);
+    strncpy(post_data, json_string, sizeof(post_data) - 1);
+    post_data[sizeof(post_data) - 1] = '\0';
+    
+    ESP_LOGI(TAG, "Email/password auth URL: %s", url);
+    ESP_LOGI(TAG, "Authenticating user: %s", this->firebaseEmail.c_str());
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+    config.timeout_ms = 10000;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    
+    esp_err_t err = esp_http_client_open(client, strlen(post_data));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(json_string);
+        cJSON_Delete(json);
+        return err;
+    }
+    
+    int wlen = esp_http_client_write(client, post_data, strlen(post_data));
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "Failed to write request data");
+        esp_http_client_cleanup(client);
+        free(json_string);
+        cJSON_Delete(json);
+        return ESP_FAIL;
+    }
+    
+    int content_length = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+    
+    ESP_LOGI(TAG, "Email/password auth response status: %d, content_length: %d", status_code, content_length);
+    
+    // Read response data
+    int total_read = 0;
+    if (content_length > 0) {
+        total_read = esp_http_client_read(client, response_buffer, content_length);
+    } else {
+        // Handle chunked transfer encoding
+        int data_read;
+        while ((data_read = esp_http_client_read(client, response_buffer + total_read, 2047 - total_read)) > 0) {
+            total_read += data_read;
+            if (total_read >= 2047) break;
+        }
+    }
+    response_buffer[total_read] = '\0';
+    
+    esp_http_client_close(client);
+    
+    ESP_LOGI(TAG, "Response buffer content (%d bytes): %s", total_read, response_buffer);
+    
+    if (status_code == 200) {
+        cJSON *response_json = cJSON_Parse(response_buffer);
+        if (response_json != NULL) {
+            cJSON *id_token = cJSON_GetObjectItem(response_json, "idToken");
+            cJSON *refresh_token = cJSON_GetObjectItem(response_json, "refreshToken");
+            cJSON *expires_in = cJSON_GetObjectItem(response_json, "expiresIn");
+            cJSON *local_id = cJSON_GetObjectItem(response_json, "localId");
+            
+            if (cJSON_IsString(id_token) && id_token->valuestring != NULL) {
+                this->firebaseIdToken = id_token->valuestring;
+                
+                if (cJSON_IsString(refresh_token) && refresh_token->valuestring != NULL) {
+                    this->firebaseRefreshToken = refresh_token->valuestring;
+                }
+                
+                // Set expiration time (default 1 hour if not specified)
+                int expires_seconds = 3600;
+                if (cJSON_IsString(expires_in) && expires_in->valuestring != NULL) {
+                    expires_seconds = atoi(expires_in->valuestring);
+                }
+                
+                this->firebaseTokenExpiresAt = time(NULL) + expires_seconds;
+                this->firebaseAuthenticated = true;
+                
+                if (cJSON_IsString(local_id) && local_id->valuestring != NULL) {
+                    ESP_LOGI(TAG, "✓ Email/password authentication successful for user: %s", local_id->valuestring);
+                }
+                ESP_LOGI(TAG, "✓ Firebase ID token expires in %d seconds", expires_seconds);
+                
+                err = ESP_OK;
+            } else {
+                ESP_LOGE(TAG, "Invalid email/password auth response: missing idToken");
+                err = ESP_FAIL;
+            }
+            cJSON_Delete(response_json);
+        } else {
+            ESP_LOGE(TAG, "Failed to parse email/password auth response");
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Email/password authentication failed with status %d", status_code);
+        ESP_LOGE(TAG, "Auth response: %s", response_buffer);
+        
+        // Parse error response for better error messages
+        cJSON *error_json = cJSON_Parse(response_buffer);
+        if (error_json != NULL) {
+            cJSON *error_obj = cJSON_GetObjectItem(error_json, "error");
+            if (error_obj != NULL) {
+                cJSON *message = cJSON_GetObjectItem(error_obj, "message");
+                if (cJSON_IsString(message)) {
+                    if (strcmp(message->valuestring, "EMAIL_NOT_FOUND") == 0) {
+                        ESP_LOGE(TAG, "🔑 EMAIL_NOT_FOUND: The email address is not registered.");
+                    } else if (strcmp(message->valuestring, "INVALID_PASSWORD") == 0) {
+                        ESP_LOGE(TAG, "🔑 INVALID_PASSWORD: The password is incorrect.");
+                    } else if (strcmp(message->valuestring, "USER_DISABLED") == 0) {
+                        ESP_LOGE(TAG, "🔑 USER_DISABLED: The user account has been disabled.");
+                    } else {
+                        ESP_LOGE(TAG, "🔑 Firebase Auth Error: %s", message->valuestring);
+                    }
+                }
+            }
+            cJSON_Delete(error_json);
+        }
+        
+        this->firebaseAuthenticated = false;
+        err = ESP_FAIL;
+    }
+    
+    esp_http_client_cleanup(client);
+    free(json_string);
+    cJSON_Delete(json);
+    return err;
+}
 
+bool BrewEngine::isCustomTokenExpired()
+{
+    if (this->firebaseAuthToken.empty()) {
+        ESP_LOGE(TAG, "No custom token to check");
+        return true;
+    }
+    
+    // Simple JWT expiration check - decode the payload (base64)
+    // JWT format: header.payload.signature
+    size_t first_dot = this->firebaseAuthToken.find('.');
+    size_t second_dot = this->firebaseAuthToken.find('.', first_dot + 1);
+    
+    if (first_dot == string::npos || second_dot == string::npos) {
+        ESP_LOGE(TAG, "Invalid JWT token format");
+        return true;
+    }
+    
+    string payload_b64 = this->firebaseAuthToken.substr(first_dot + 1, second_dot - first_dot - 1);
+    
+    // Add padding if needed for base64 decoding
+    while (payload_b64.length() % 4 != 0) {
+        payload_b64 += "=";
+    }
+    
+    // For now, just check if we can parse it and warn about expiration
+    ESP_LOGI(TAG, "Custom token payload length: %d characters", payload_b64.length());
+    ESP_LOGW(TAG, "⚠️  Custom tokens expire after 1 hour. If authentication fails, generate a new token.");
+    
+    return false; // For now, let Firebase validate it
+}
+
+esp_err_t BrewEngine::ensureFirebaseAuthenticated()
+{
+    if (isFirebaseTokenValid()) {
+        return ESP_OK;
+    }
+    
+    // Try to refresh using existing refresh token first
+    if (!this->firebaseRefreshToken.empty()) {
+        ESP_LOGI(TAG, "Attempting to refresh Firebase token using refresh token...");
+        esp_err_t refresh_result = refreshFirebaseToken();
+        if (refresh_result == ESP_OK) {
+            ESP_LOGI(TAG, "Successfully refreshed Firebase token");
+            return ESP_OK;
+        } else {
+            ESP_LOGW(TAG, "Token refresh failed, trying other authentication methods");
+        }
+    }
+    
+    // Authenticate based on the selected method
+    if (this->firebaseAuthMethod == "email") {
+        // Email/password method
+        if (!this->firebaseEmail.empty() && !this->firebasePassword.empty()) {
+            ESP_LOGI(TAG, "Attempting email/password authentication...");
+            esp_err_t email_result = authenticateWithEmailPassword();
+            if (email_result == ESP_OK) {
+                ESP_LOGI(TAG, "Successfully authenticated with email/password");
+                return ESP_OK;
+            } else {
+                ESP_LOGE(TAG, "Email/password authentication failed");
+                return email_result;
+            }
+        } else {
+            ESP_LOGE(TAG, "Email/password authentication selected but credentials not configured");
+            return ESP_ERR_INVALID_STATE;
+        }
+    } else if (this->firebaseAuthMethod == "token") {
+        // Custom token method
+        if (!this->firebaseAuthToken.empty()) {
+            // Check if custom token might be expired
+            isCustomTokenExpired(); // This will log warnings
+            
+            ESP_LOGI(TAG, "Firebase token expired or invalid, authenticating with custom token...");
+            return exchangeCustomTokenForIdToken();
+        } else {
+            ESP_LOGE(TAG, "Custom token authentication selected but token not configured");
+            return ESP_ERR_INVALID_STATE;
+        }
+    } else {
+        ESP_LOGE(TAG, "Invalid authentication method: %s", this->firebaseAuthMethod.c_str());
+        return ESP_ERR_INVALID_STATE;
+    }
+}
+
+esp_err_t BrewEngine::http_event_handler(esp_http_client_event_t *evt)
+{
+    static int output_len;
+    
+    switch(evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            if (!esp_http_client_is_chunked_response(evt->client)) {
+                if (evt->user_data) {
+                    memcpy((char*)evt->user_data + output_len, evt->data, evt->data_len);
+                    output_len += evt->data_len;
+                }
+            }
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+            output_len = 0;
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+            output_len = 0;
+            break;
+        case HTTP_EVENT_REDIRECT:
+            ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
+            break;
+    }
+    return ESP_OK;
+}
+
+esp_err_t BrewEngine::writeTemperatureToFirebase(float temperature, float targetTemperature, uint8_t pidOutput, const string &status)
+{
+    if (!this->firebaseEnabled || !this->firebaseDatabaseEnabled)
+    {
+        return ESP_FAIL;
+    }
+
+    char url[2200];  // Increased buffer size for safety
+    time_t now = time(NULL);
+    
+    // Validate Firebase URL is configured
+    if (this->firebaseUrl.empty()) {
+        ESP_LOGE(TAG, "Firebase URL not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // Ensure we have valid authentication
+    esp_err_t auth_result = ensureFirebaseAuthenticated();
+    if (auth_result != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot write temperature: Firebase authentication failed");
+        return auth_result;
+    }
+    
+    // Construct URL with authentication token
+    ESP_LOGI(TAG, "Firebase URL for URL construction: len=%d, first char code=%d, content: '%s'", 
+             this->firebaseUrl.length(), this->firebaseUrl.empty() ? -1 : (int)this->firebaseUrl[0], this->firebaseUrl.c_str());
+    
+    int url_len = snprintf(url, sizeof(url), "%s/temperatures/%lld.json?auth=%s", 
+                          this->firebaseUrl.c_str(), (long long)now, this->firebaseIdToken.c_str());
+    
+    // Validate URL was constructed properly
+    if (url_len >= sizeof(url)) {
+        ESP_LOGE(TAG, "URL too long: %d bytes (max %d)", url_len, (int)sizeof(url));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    
+    if (url_len <= 0) {
+        ESP_LOGE(TAG, "Failed to construct URL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Firebase URL (%d bytes): %s", url_len, url);
+    ESP_LOGI(TAG, "URL starts with https: %s", strncmp(url, "https://", 8) == 0 ? "YES" : "NO");
+    
+    cJSON *json = cJSON_CreateObject();
+    cJSON *temp_value = cJSON_CreateNumber(temperature);
+    cJSON *target_value = cJSON_CreateNumber(targetTemperature);
+    cJSON *pid_value = cJSON_CreateNumber(pidOutput);
+    cJSON *timestamp = cJSON_CreateNumber(now);
+    cJSON *status_value = cJSON_CreateString(status.c_str());
+    cJSON *hostname = cJSON_CreateString(this->Hostname.c_str());
+    cJSON *session_id = cJSON_CreateNumber(this->currentSessionId);
+    
+    cJSON_AddItemToObject(json, "temperature", temp_value);
+    cJSON_AddItemToObject(json, "targetTemperature", target_value);
+    cJSON_AddItemToObject(json, "pidOutput", pid_value);
+    cJSON_AddItemToObject(json, "timestamp", timestamp);
+    cJSON_AddItemToObject(json, "status", status_value);
+    cJSON_AddItemToObject(json, "hostname", hostname);
+    cJSON_AddItemToObject(json, "sessionId", session_id);
+    
+    char *json_string = cJSON_Print(json);
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to serialize JSON - out of memory");
+        cJSON_Delete(json);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    ESP_LOGI(TAG, "JSON payload size: %d bytes", strlen(json_string));
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_PUT;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 4096;
+    config.buffer_size_tx = 4096;
+    config.timeout_ms = 10000;  // 10 second timeout
+    
+    // Validate URL format before creating client
+    ESP_LOGI(TAG, "About to validate URL: %s", url);
+    ESP_LOGI(TAG, "URL validation - starts with https: %s", strncmp(url, "https://", 8) == 0 ? "YES" : "NO");
+    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) {
+        ESP_LOGE(TAG, "Invalid URL format - must start with http:// or https://");
+        ESP_LOGE(TAG, "URL first 10 chars: '%.10s'", url);
+        free(json_string);
+        cJSON_Delete(json);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client - check URL format and memory");
+        ESP_LOGE(TAG, "URL being used: %s", url);
+        free(json_string);
+        cJSON_Delete(json);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_err_t set_field_err = esp_http_client_set_post_field(client, json_string, strlen(json_string));
+    if (set_field_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set POST field: %s", esp_err_to_name(set_field_err));
+        esp_http_client_cleanup(client);
+        free(json_string);
+        cJSON_Delete(json);
+        return set_field_err;
+    }
+    
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Temperature written to Firebase. Status: %d", status_code);
+    } else {
+        ESP_LOGE(TAG, "Failed to write temperature: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(json_string);
+    cJSON_Delete(json);
+    
+    return err;
+}
+
+esp_err_t BrewEngine::queryLatestTemperatureFromFirebase(float *temperature, time_t *timestamp)
+{
+    if (!this->firebaseEnabled)
+    {
+        return ESP_FAIL;
+    }
+
+    char url[256];
+    static char response_buffer[1024] = {0};
+    
+    snprintf(url, sizeof(url), "%s/temperatures.json?orderBy=\"$key\"&limitToLast=1", this->firebaseUrl.c_str());
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.event_handler = this->http_event_handler;
+    config.user_data = response_buffer;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Latest temperature queried from Firebase. Status: %d", status_code);
+        
+        cJSON *json = cJSON_Parse(response_buffer);
+        if (json != NULL) {
+            cJSON *first_entry = cJSON_GetArrayItem(json, 0);
+            if (first_entry != NULL) {
+                cJSON *entry_data = cJSON_GetArrayItem(first_entry, 1);
+                if (entry_data != NULL) {
+                    cJSON *temp_value = cJSON_GetObjectItem(entry_data, "temperature");
+                    cJSON *temp_timestamp = cJSON_GetObjectItem(entry_data, "timestamp");
+                    
+                    if (cJSON_IsNumber(temp_value) && temperature != NULL) {
+                        *temperature = (float)temp_value->valuedouble;
+                    }
+                    
+                    if (cJSON_IsNumber(temp_timestamp) && timestamp != NULL) {
+                        *timestamp = (time_t)temp_timestamp->valuedouble;
+                    }
+                }
+            }
+            cJSON_Delete(json);
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to query latest temperature: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+esp_err_t BrewEngine::queryTemperatureSeriesFromFirebase(int limit)
+{
+    if (!this->firebaseEnabled)
+    {
+        return ESP_FAIL;
+    }
+
+    char url[256];
+    static char response_buffer[2048] = {0};
+    
+    snprintf(url, sizeof(url), "%s/temperatures.json?orderBy=\"$key\"&limitToLast=%d", this->firebaseUrl.c_str(), limit);
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.event_handler = this->http_event_handler;
+    config.user_data = response_buffer;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Temperature series queried from Firebase. Status: %d", status_code);
+        
+        cJSON *json = cJSON_Parse(response_buffer);
+        if (json != NULL) {
+            ESP_LOGI(TAG, "=== Temperature History (Last %d readings) ===", limit);
+            
+            cJSON *entry = NULL;
+            cJSON_ArrayForEach(entry, json) {
+                if (entry->string != NULL) {
+                    cJSON *temp_value = cJSON_GetObjectItem(entry, "temperature");
+                    cJSON *temp_timestamp = cJSON_GetObjectItem(entry, "timestamp");
+                    
+                    if (cJSON_IsNumber(temp_value) && cJSON_IsNumber(temp_timestamp)) {
+                        time_t ts = (time_t)temp_timestamp->valuedouble;
+                        float temp = (float)temp_value->valuedouble;
+                        
+                        struct tm *timeinfo = localtime(&ts);
+                        char time_str[64];
+                        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+                        
+                        ESP_LOGI(TAG, "[%s] %.1f°C (ID: %s)", time_str, temp, entry->string);
+                    }
+                }
+            }
+            ESP_LOGI(TAG, "=== End of Temperature History ===");
+            cJSON_Delete(json);
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to query temperature series: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+json BrewEngine::getFirebaseStatistics(const json &requestData)
+{
+	// Always use local statistics for Firebase implementation
 	json result;
 	
-	// Get session list with basic statistics
-	string sessionQuery = R"(
-		|> range(start: -30d)
-		|> filter(fn: (r) => r["_measurement"] == "session_metadata")
-		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
-		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-		|> sort(columns: ["_time"], desc: true)
-		|> limit(n: 50)
-	)";
+	// Get sessions
+	vector<BrewSession> sessions = this->statisticsManager->GetSessionList();
+	json jSessions = json::array();
+	for (const auto& session : sessions) {
+		json jSession;
+		jSession["sessionId"] = session.sessionId;
+		jSession["scheduleName"] = session.scheduleName;
+		jSession["startTime"] = session.startTime;
+		jSession["endTime"] = session.endTime;
+		jSession["duration"] = session.totalDuration;
+		jSession["dataPoints"] = session.dataPoints;
+		jSession["avgTemperature"] = session.avgTemperature;
+		jSession["minTemperature"] = session.minTemperature;
+		jSession["maxTemperature"] = session.maxTemperature;
+		jSession["completed"] = session.completed;
+		jSessions.push_back(jSession);
+	}
 	
-	string sessionResponse = this->queryInfluxDB(sessionQuery);
+	// Get stats
+	map<string, uint32_t> stats = this->statisticsManager->GetSessionStats();
 	
-	// Get temperature statistics for sessions
-	string tempQuery = R"(
-		|> range(start: -30d)
-		|> filter(fn: (r) => r["_measurement"] == "temperature")
-		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
-		|> group(columns: ["session_id"])
-		|> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
-		|> yield(name: "session_temps")
-	)";
-	
-	string tempResponse = this->queryInfluxDB(tempQuery);
-	
-	// Process the responses and build the result
-	json sessions = json::array();
-	json stats = {
-		{"totalSessions", 0},
-		{"totalBrewTime", 0},
-		{"avgSessionDuration", 0}
-	};
-	
+	// Get config
 	json config = {
-		{"maxSessions", 100},
-		{"currentSessionActive", this->controlRun},
-		{"currentSessionId", to_string(this->currentSessionId)},
-		{"currentDataPoints", 0},
-		{"retentionPolicy", "30d"}
+		{"maxSessions", this->statisticsManager->GetMaxSessions()},
+		{"currentSessionActive", this->statisticsManager->IsSessionActive()},
+		{"currentSessionId", this->statisticsManager->GetCurrentSessionId()},
+		{"currentDataPoints", this->statisticsManager->GetCurrentSessionDataPoints()},
+		{"firebaseUrl", this->firebaseUrl},
+		{"firebaseEnabled", this->firebaseEnabled}
 	};
 	
-	// TODO: Parse InfluxDB response and populate sessions array
-	// For now, return basic structure
-	
-	result["sessions"] = sessions;
+	result["sessions"] = jSessions;
 	result["stats"] = stats;
 	result["config"] = config;
 	
 	return result;
 }
 
-json BrewEngine::getInfluxDBSessionData(const json &requestData)
+json BrewEngine::getFirebaseSessionData(const json &requestData)
 {
-	if (!this->influxdbEnabled)
-	{
-		// Fallback to local statistics if InfluxDB is not enabled
-		uint32_t sessionId = requestData["sessionId"];
-		BrewSession session = this->statisticsManager->GetSessionById(sessionId);
-		
-		if (session.sessionId == 0) {
-			// Session not found
-			json result;
-			result["error"] = "Session not found";
-			return result;
-		}
-		
-		vector<TempDataPoint> sessionData = this->statisticsManager->GetSessionData(sessionId);
-		
+	// Always use local statistics for Firebase implementation
+	uint32_t sessionId = requestData["sessionId"];
+	BrewSession session = this->statisticsManager->GetSessionById(sessionId);
+	
+	if (session.sessionId == 0) {
+		// Session not found
 		json result;
-		result["sessionId"] = session.sessionId;
-		result["scheduleName"] = session.scheduleName;
-		result["startTime"] = session.startTime;
-		result["endTime"] = session.endTime;
-		result["duration"] = session.totalDuration;
-		result["avgTemperature"] = session.avgTemperature;
-		result["minTemperature"] = session.minTemperature;
-		result["maxTemperature"] = session.maxTemperature;
-		result["completed"] = session.completed;
-		
-		json jData = json::array();
-		for (const auto& point : sessionData) {
-			json jPoint;
-			jPoint["timestamp"] = point.timestamp;
-			jPoint["avgTemp"] = (int)point.avgTemp;
-			jPoint["targetTemp"] = (int)point.targetTemp;
-			jPoint["pidOutput"] = (int)point.pidOutput;
-			jData.push_back(jPoint);
-		}
-		
-		result["data"] = jData;
+		result["error"] = "Session not found";
 		return result;
 	}
-
+	
+	vector<TempDataPoint> sessionData = this->statisticsManager->GetSessionData(sessionId);
+	
 	json result;
+	result["sessionId"] = session.sessionId;
+	result["scheduleName"] = session.scheduleName;
+	result["startTime"] = session.startTime;
+	result["endTime"] = session.endTime;
+	result["duration"] = session.totalDuration;
+	result["avgTemperature"] = session.avgTemperature;
+	result["minTemperature"] = session.minTemperature;
+	result["maxTemperature"] = session.maxTemperature;
+	result["completed"] = session.completed;
 	
-	string sessionId = requestData["sessionId"];
-	string resolution = requestData.contains("resolution") ? requestData["resolution"] : "1m";
+	json jData = json::array();
+	for (const auto& point : sessionData) {
+		json jPoint;
+		jPoint["timestamp"] = point.timestamp;
+		jPoint["avgTemp"] = (int)point.avgTemp;
+		jPoint["targetTemp"] = (int)point.targetTemp;
+		jPoint["pidOutput"] = (int)point.pidOutput;
+		jData.push_back(jPoint);
+	}
 	
-	// Get session metadata
-	string metadataQuery = R"(
-		|> range(start: -30d)
-		|> filter(fn: (r) => r["_measurement"] == "session_metadata")
-		|> filter(fn: (r) => r["session_id"] == ")" + sessionId + R"(")
-		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
-		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-		|> last()
-	)";
-	
-	string metadataResponse = this->queryInfluxDB(metadataQuery);
-	
-	// Get temperature data with specified resolution
-	string tempQuery = R"(
-		|> range(start: -30d)
-		|> filter(fn: (r) => r["_measurement"] == "temperature")
-		|> filter(fn: (r) => r["session_id"] == ")" + sessionId + R"(")
-		|> filter(fn: (r) => r["host"] == ")" + this->Hostname + R"(")
-		|> aggregateWindow(every: )" + resolution + R"(, fn: mean, createEmpty: false)
-		|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-		|> sort(columns: ["_time"])
-	)";
-	
-	string tempResponse = this->queryInfluxDB(tempQuery);
-	
-	// Process the responses and build the result
-	result["sessionId"] = sessionId;
-	result["data"] = json::array();
-	
-	// TODO: Parse InfluxDB response and populate data array
-	// For now, return basic structure
-	
+	result["data"] = jData;
 	return result;
 }
 
@@ -2321,40 +2971,17 @@ void BrewEngine::readLoop(void *arg)
 				esp_mqtt_client_publish(instance->mqttClient, instance->mqttTopic.c_str(), payload.c_str(), 0, 1, 1);
 			}
 
-			// Send to InfluxDB (with interval check)
-			if (instance->influxdbEnabled)
+			// Send to Firebase (with interval check)
+			if (instance->firebaseEnabled)
 			{
 				auto now = system_clock::now();
-				auto timeSinceLastSend = duration_cast<seconds>(now - instance->lastInfluxDBSend).count();
+				auto timeSinceLastSend = duration_cast<seconds>(now - instance->lastFirebaseSend).count();
 				
-				if (timeSinceLastSend >= instance->influxdbSendInterval)
+				if (timeSinceLastSend >= instance->firebaseSendInterval)
 				{
-					instance->lastInfluxDBSend = now;
-				string fields = "temperature=" + to_string(instance->temperature) + 
-								",target_temperature=" + to_string(instance->targetTemperature) + 
-								",pid_output=" + to_string(instance->pidOutput);
-				
-				string tags = "status=" + instance->escapeInfluxDBTagValue(instance->statusText);
-				if (instance->controlRun && !instance->selectedMashScheduleName.empty())
-				{
-					tags += ",schedule=" + instance->escapeInfluxDBTagValue(instance->selectedMashScheduleName);
-				}
-				
-				instance->sendToInfluxDB("temperature", fields, tags);
-				
-				// Send individual sensor readings
-				for (auto const &[sensorId, sensor] : instance->sensors)
-				{
-					if (sensor->show && sensor->lastTemp != -999)
-					{
-						string sensorFields = "temperature=" + to_string(sensor->lastTemp);
-						string sensorTags = "sensor_id=" + to_string(sensorId) + 
-										   ",sensor_name=" + instance->escapeInfluxDBTagValue(sensor->name) + 
-										   ",sensor_type=" + to_string(sensor->sensorType);
-						
-						instance->sendToInfluxDB("sensor_temperature", sensorFields, sensorTags);
-					}
-				}
+					instance->lastFirebaseSend = now;
+					instance->writeTemperatureToFirebase(instance->temperature, instance->targetTemperature, 
+						instance->pidOutput, instance->statusText);
 				}
 			}
 		}
@@ -2977,14 +3604,11 @@ string BrewEngine::processCommand(const string &payLoad)
 		this->start();
 		this->statisticsManager->StartSession(this->selectedMashScheduleName);
 		
-		// Log session start to InfluxDB
-		if (this->influxdbEnabled)
+		// Log session start to Firebase
+		if (this->firebaseEnabled)
 		{
-			time_t startTime = time(0);
-			string fields = "schedule_name=\"" + this->selectedMashScheduleName + "\"" +
-							",start_time=" + to_string(startTime) +
-							",completed=false";
-			this->sendToInfluxDB("session_metadata", fields);
+			// Session metadata is now tracked by local statistics manager
+			ESP_LOGI(TAG, "Session started - metadata logged locally and to Firebase via temperature writes");
 		}
 	}
 	else if (command == "StartStir")
@@ -2996,13 +3620,11 @@ string BrewEngine::processCommand(const string &payLoad)
 		this->stop();
 		this->statisticsManager->EndSession();
 		
-		// Log session end to InfluxDB
-		if (this->influxdbEnabled)
+		// Log session end to Firebase
+		if (this->firebaseEnabled)
 		{
-			time_t endTime = time(0);
-			string fields = "end_time=" + to_string(endTime) +
-							",completed=true";
-			this->sendToInfluxDB("session_metadata", fields);
+			// Session metadata is now tracked by local statistics manager
+			ESP_LOGI(TAG, "Session ended - metadata logged locally");
 		}
 	}
 	else if (command == "StopStir")
@@ -3261,11 +3883,14 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"spiMisoPin", this->spi_miso_pin},
 			{"spiClkPin", this->spi_clk_pin},
 			{"spiCsPin", this->spi_cs_pin},
-			{"influxdbUrl", this->influxdbUrl},
-			{"influxdbToken", this->influxdbToken},
-			{"influxdbOrg", this->influxdbOrg},
-			{"influxdbBucket", this->influxdbBucket},
-			{"influxdbSendInterval", this->influxdbSendInterval},
+			{"firebaseUrl", this->firebaseUrl},
+			{"firebaseApiKey", this->firebaseApiKey},
+			{"firebaseAuthToken", this->firebaseAuthToken},
+			{"firebaseEmail", this->firebaseEmail},
+			{"firebasePassword", this->firebasePassword},
+			{"firebaseAuthMethod", this->firebaseAuthMethod},
+			{"firebaseSendInterval", this->firebaseSendInterval},
+			{"firebaseDatabaseEnabled", this->firebaseDatabaseEnabled},
 		};
 	}
 	else if (command == "SaveSystemSettings")
@@ -3273,20 +3898,23 @@ string BrewEngine::processCommand(const string &payLoad)
 		this->saveSystemSettingsJson(data);
 		message = "Please restart device for changes to have effect!";
 	}
-	else if (command == "TestInfluxDB")
+	else if (command == "TestFirebase")
 	{
-		if (this->influxdbUrl.empty() || this->influxdbToken.empty() || 
-		    this->influxdbOrg.empty() || this->influxdbBucket.empty())
+		if (this->firebaseUrl.empty())
 		{
-			message = "InfluxDB configuration incomplete";
+			message = "Firebase configuration incomplete";
 			success = false;
 		}
 		else
 		{
 			// Test connection with a dummy data point
-			string testData = "test_connection,source=brew_engine value=1";
-			this->sendToInfluxDB("test_connection", "value=1", "");
-			message = "InfluxDB connection test completed - check logs for results";
+			esp_err_t result = this->writeTemperatureToFirebase(25.0, 25.0, 50, "test");
+			if (result == ESP_OK) {
+				message = "Firebase connection test successful";
+			} else {
+				message = "Firebase connection test failed - check logs for details";
+				success = false;
+			}
 		}
 	}
 	else if (command == "Reboot")
@@ -3314,9 +3942,9 @@ string BrewEngine::processCommand(const string &payLoad)
 	}
 	else if (command == "GetStatistics")
 	{
-		if (this->influxdbEnabled)
+		if (this->firebaseEnabled)
 		{
-			resultData = this->getInfluxDBStatistics(data);
+			resultData = this->getFirebaseStatistics(data);
 		}
 		else
 		{
@@ -3360,9 +3988,9 @@ string BrewEngine::processCommand(const string &payLoad)
 			success = false;
 		}
 		else {
-			if (this->influxdbEnabled)
+			if (this->firebaseEnabled)
 			{
-				resultData = this->getInfluxDBSessionData(data);
+				resultData = this->getFirebaseSessionData(data);
 			}
 			else
 			{

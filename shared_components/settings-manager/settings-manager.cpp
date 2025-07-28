@@ -76,13 +76,43 @@ void SettingsManager::FactoryReset()
 
 string SettingsManager::Read(string name, string defaultValue)
 {
-
     size_t size = 0;
     esp_err_t err = nvs_get_str(*this->nvsHandle, name.c_str(), NULL, &size);
 
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
     {
-        ESP_LOGE(TAG, "Error reading Setting: %s", name.c_str());
+        ESP_LOGE(TAG, "Error reading string setting: %s - %s", name.c_str(), esp_err_to_name(err));
+        
+        // If string read failed, try reading as blob (for long Firebase tokens)
+        size_t blob_size = 0;
+        esp_err_t blob_err = nvs_get_blob(*this->nvsHandle, name.c_str(), NULL, &blob_size);
+        
+        if (blob_err == ESP_OK && blob_size > 0)
+        {
+            ESP_LOGI(TAG, "Found blob storage for setting: %s (size: %d)", name.c_str(), blob_size);
+            
+            char *blob_chars = (char *)malloc(blob_size);
+            blob_err = nvs_get_blob(*this->nvsHandle, name.c_str(), blob_chars, &blob_size);
+            
+            if (blob_err == ESP_OK)
+            {
+                string result(blob_chars, blob_size - 1); // -1 to exclude null terminator
+                
+                // Debug logging for blob reads
+                if (name == "fbUrl" && !result.empty()) {
+                    ESP_LOGI(TAG, "Read fbUrl from blob: len=%d, first char code=%d, content: '%s'", 
+                             result.length(), (int)result[0], result.c_str());
+                }
+                
+                free(blob_chars);
+                return result;
+            }
+            else
+            {
+                ESP_LOGE(TAG, "Error reading blob setting: %s - %s", name.c_str(), esp_err_to_name(blob_err));
+                free(blob_chars);
+            }
+        }
     }
 
     if (size == 0)
@@ -99,9 +129,20 @@ string SettingsManager::Read(string name, string defaultValue)
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Error reading Setting: %s", name.c_str());
+        free(chars);
+        return defaultValue;
     }
 
-    return (string)chars;
+    string result(chars);
+    free(chars);
+    
+    // Debug logging for specific Firebase URL reading
+    if (name == "fbUrl" && !result.empty()) {
+        ESP_LOGI(TAG, "Read fbUrl: len=%d, first char code=%d, content: '%s'", 
+                 result.length(), (int)result[0], result.c_str());
+    }
+    
+    return result;
 }
 
 vector<uint8_t> SettingsManager::Read(string name, vector<uint8_t> defaultValue)
@@ -224,7 +265,25 @@ void SettingsManager::Write(string name, string value)
 
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Error writing Setting: %s", name.c_str());
+        ESP_LOGE(TAG, "Error writing Setting: %s - %s (len: %d)", name.c_str(), esp_err_to_name(err), value.length());
+        
+        // If string is too large for nvs_set_str, try blob storage for very long values
+        if (err == ESP_ERR_NVS_VALUE_TOO_LONG && value.length() > 4000)
+        {
+            ESP_LOGI(TAG, "String too long for NVS str, trying blob storage for: %s", name.c_str());
+            
+            // Store as blob for very long strings
+            err = nvs_set_blob(*this->nvsHandle, name.c_str(), value.c_str(), value.length() + 1);
+            
+            if (err == ESP_OK)
+            {
+                ESP_LOGI(TAG, "Successfully stored long string as blob: %s", name.c_str());
+            }
+            else
+            {
+                ESP_LOGE(TAG, "Failed to store long string as blob: %s - %s", name.c_str(), esp_err_to_name(err));
+            }
+        }
     }
 }
 
