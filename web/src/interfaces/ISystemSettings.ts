@@ -7,11 +7,14 @@ export interface ISystemSettings {
   buzzerTime: number;
   invertOutputs: boolean;
   mqttUri: string;
-  influxdbUrl: string;
-  influxdbToken: string;
-  influxdbOrg: string;
-  influxdbBucket: string;
-  influxdbSendInterval: number;
+  firebaseUrl: string;
+  firebaseApiKey: string;
+  firebaseAuthToken: string;
+  firebaseEmail: string;
+  firebasePassword: string;
+  firebaseAuthMethod: string; // "email" or "token"
+  firebaseSendInterval: number;
+  firebaseDatabaseEnabled: boolean;
   temperatureScale: TemperatureScale;
   rtdSensorsEnabled: boolean;
   spiMosiPin: number;

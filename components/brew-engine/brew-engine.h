@@ -13,6 +13,8 @@
 #include "esp_log.h"
 #include <esp_http_server.h>
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
 #include "esp_ota_ops.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
@@ -206,21 +208,37 @@ private:
     string mqttTopic = "";
     string mqttTopicLog = "";
 
-    // InfluxDB
-    bool influxdbEnabled = false;
-    string influxdbUrl = "";
-    string influxdbToken = "";
-    string influxdbOrg = "";
-    string influxdbBucket = "";
-    uint16_t influxdbSendInterval = 10; // seconds between database writes
-    system_clock::time_point lastInfluxDBSend;
+    // Firebase
+    bool firebaseEnabled = false;
+    bool firebaseDatabaseEnabled = true;
+    string firebaseUrl = "";
+    string firebaseApiKey = "";
+    string firebaseAuthToken = "";
+    uint16_t firebaseSendInterval = 10; // seconds between database writes
+    system_clock::time_point lastFirebaseSend;
     uint32_t currentSessionId = 0;
-    void initInfluxDB();
-    string escapeInfluxDBTagValue(const string &value);
-    void sendToInfluxDB(const string &measurement, const string &fields, const string &tags = "");
-    string queryInfluxDB(const string &query);
-    json getInfluxDBStatistics(const json &requestData);
-    json getInfluxDBSessionData(const json &requestData);
+    
+    // Firebase authentication state
+    string firebaseIdToken = "";
+    string firebaseRefreshToken = "";
+    string firebaseEmail = "";
+    string firebasePassword = "";
+    string firebaseAuthMethod = "email"; // "email" or "token"
+    time_t firebaseTokenExpiresAt = 0;
+    bool firebaseAuthenticated = false;
+    void initFirebase();
+    esp_err_t ensureFirebaseAuthenticated();
+    esp_err_t exchangeCustomTokenForIdToken();
+    esp_err_t refreshFirebaseToken();
+    esp_err_t authenticateWithEmailPassword();
+    bool isFirebaseTokenValid();
+    bool isCustomTokenExpired();
+    static esp_err_t http_event_handler(esp_http_client_event_t *evt);
+    esp_err_t writeTemperatureToFirebase(float temperature, float targetTemperature, uint8_t pidOutput, const string &status);
+    esp_err_t queryLatestTemperatureFromFirebase(float *temperature, time_t *timestamp);
+    esp_err_t queryTemperatureSeriesFromFirebase(int limit);
+    json getFirebaseStatistics(const json &requestData);
+    json getFirebaseSessionData(const json &requestData);
 
     // stirring/pumping
     TaskHandle_t stirLoopHandle = NULL;

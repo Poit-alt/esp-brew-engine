@@ -16,11 +16,14 @@ const systemSettings = ref<ISystemSettings>({
   buzzerTime: 2,
   invertOutputs: false,
   mqttUri: "",
-  influxdbUrl: "",
-  influxdbToken: "",
-  influxdbOrg: "",
-  influxdbBucket: "",
-  influxdbSendInterval: 10,
+  firebaseUrl: "",
+  firebaseApiKey: "",
+  firebaseAuthToken: "",
+  firebaseEmail: "",
+  firebasePassword: "",
+  firebaseAuthMethod: "email", // default to email method
+  firebaseSendInterval: 10,
+  firebaseDatabaseEnabled: true,
   temperatureScale: 0,
   rtdSensorsEnabled: false,
   spiMosiPin: 23,
@@ -142,16 +145,46 @@ const scaleChanged = () => {
   alert.value = t("systemSettings.mash_cant_be_converted");
 };
 
-const testInfluxDB = async () => {
-  if (!systemSettings.value.influxdbUrl || !systemSettings.value.influxdbToken || 
-      !systemSettings.value.influxdbOrg || !systemSettings.value.influxdbBucket) {
-    alert.value = "Please fill in all InfluxDB configuration fields";
+const testFirebase = async () => {
+  if (!systemSettings.value.firebaseDatabaseEnabled) {
+    alert.value = "Firebase database is disabled";
     alertType.value = "warning";
     return;
   }
+  if (!systemSettings.value.firebaseUrl) {
+    alert.value = "Please fill in Firebase URL";
+    alertType.value = "warning";
+    return;
+  }
+  // API Key is always required
+  if (!systemSettings.value.firebaseApiKey) {
+    alert.value = "Please fill in Firebase API Key";
+    alertType.value = "warning";
+    return;
+  }
+  
+  // Validate based on selected authentication method
+  if (systemSettings.value.firebaseAuthMethod === 'email') {
+    if (!systemSettings.value.firebaseEmail) {
+      alert.value = "Please fill in Firebase Email";
+      alertType.value = "warning";
+      return;
+    }
+    if (!systemSettings.value.firebasePassword) {
+      alert.value = "Please fill in Firebase Password";
+      alertType.value = "warning";
+      return;
+    }
+  } else if (systemSettings.value.firebaseAuthMethod === 'token') {
+    if (!systemSettings.value.firebaseAuthToken) {
+      alert.value = "Please fill in Firebase Custom Token";
+      alertType.value = "warning";
+      return;
+    }
+  }
 
   const requestData = {
-    command: "TestInfluxDB",
+    command: "TestFirebase",
     data: null,
   };
 
@@ -253,28 +286,64 @@ const testInfluxDB = async () => {
 
       <v-row>
         <v-col cols="12" md="12">
-          <h3>InfluxDB Configuration</h3>
+          <h3>Firebase Configuration</h3>
+          <p class="text-body-2 text-medium-emphasis mb-2">
+            Choose your Firebase authentication method below.
+          </p>
         </v-col>
       </v-row>
 
       <v-row>
-        <v-col cols="12" md="3">
-          <v-text-field v-model="systemSettings.influxdbUrl" placeholder="http://localhost:8086"
-            label="InfluxDB URL">
+        <v-col cols="12" md="6">
+          <v-checkbox v-model="systemSettings.firebaseDatabaseEnabled" label="Enable Firebase Database Logging">
             <template v-slot:append>
-              <v-tooltip text="InfluxDB server URL">
+              <v-tooltip text="Enable or disable Firebase database logging. Automatically disabled in AP mode since internet connection is required.">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>
               </v-tooltip>
             </template>
-          </v-text-field>
+          </v-checkbox>
         </v-col>
-        <v-col cols="12" md="3">
-          <v-text-field v-model="systemSettings.influxdbToken" type="password"
-            label="InfluxDB Token">
+      </v-row>
+
+      <v-row v-if="systemSettings.firebaseDatabaseEnabled">
+        <v-col cols="12">
+          <v-radio-group v-model="systemSettings.firebaseAuthMethod" inline>
+            <template v-slot:label>
+              <div class="text-subtitle-1 fw-bold">Authentication Method:</div>
+            </template>
+            <v-radio label="Email & Password (Recommended)" value="email">
+              <template v-slot:label>
+                <div>
+                  <strong>Email & Password</strong> <span class="text-success">(Recommended)</span>
+                  <div class="text-caption text-medium-emphasis">
+                    Standard Firebase user authentication - no token expiration issues
+                  </div>
+                </div>
+              </template>
+            </v-radio>
+            <v-radio label="API Key & Custom Token" value="token">
+              <template v-slot:label>
+                <div>
+                  <strong>API Key & Custom Token</strong>
+                  <div class="text-caption text-medium-emphasis">
+                    Service account authentication - requires token regeneration every hour
+                  </div>
+                </div>
+              </template>
+            </v-radio>
+          </v-radio-group>
+        </v-col>
+      </v-row>
+
+      <v-row v-if="systemSettings.firebaseDatabaseEnabled">
+        <v-col cols="12" md="6">
+          <v-text-field v-model="systemSettings.firebaseUrl" placeholder="https://your-project.firebasedatabase.app"
+            label="Firebase URL"
+            @blur="systemSettings.firebaseUrl = systemSettings.firebaseUrl.trim()">
             <template v-slot:append>
-              <v-tooltip text="InfluxDB authentication token">
+              <v-tooltip text="Firebase Realtime Database URL">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>
@@ -284,12 +353,57 @@ const testInfluxDB = async () => {
         </v-col>
       </v-row>
 
-      <v-row>
-        <v-col cols="12" md="3">
-          <v-text-field v-model="systemSettings.influxdbOrg" 
-            label="InfluxDB Organization">
+      <v-row v-if="systemSettings.firebaseDatabaseEnabled">
+        <v-col cols="12">
+          <v-textarea v-model="systemSettings.firebaseApiKey" 
+            placeholder="AIzaSyC..."
+            label="Firebase Web API Key"
+            rows="2"
+            variant="outlined"
+            hide-details="auto"
+            @blur="systemSettings.firebaseApiKey = systemSettings.firebaseApiKey.trim()">
             <template v-slot:append>
-              <v-tooltip text="InfluxDB organization name">
+              <v-tooltip text="Firebase Web API Key from Project Settings > General > Web API Key. Paste the full key here.">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-textarea>
+        </v-col>
+      </v-row>
+
+      <v-row v-if="systemSettings.firebaseAuthMethod === 'token' && systemSettings.firebaseDatabaseEnabled">
+        <v-col cols="12">
+          <v-textarea v-model="systemSettings.firebaseAuthToken" 
+            placeholder="eyJhbGciOiJS..."
+            label="Firebase Custom Token"
+            rows="3"
+            variant="outlined"
+            hide-details="auto"
+            @blur="systemSettings.firebaseAuthToken = systemSettings.firebaseAuthToken.trim()">
+            <template v-slot:append>
+              <v-tooltip text="Firebase Custom Token (JWT) generated from your service account. This token is very long - paste the complete token here.">
+                <template v-slot:activator="{ props }">
+                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
+                </template>
+              </v-tooltip>
+            </template>
+          </v-textarea>
+        </v-col>
+      </v-row>
+
+      <v-row v-if="systemSettings.firebaseAuthMethod === 'email' && systemSettings.firebaseDatabaseEnabled">
+        <v-col cols="12" md="6">
+          <v-text-field v-model="systemSettings.firebaseEmail" 
+            placeholder="device@yourdomain.com"
+            label="Firebase Email"
+            type="email"
+            variant="outlined"
+            hide-details="auto"
+            @blur="systemSettings.firebaseEmail = systemSettings.firebaseEmail.trim()">
+            <template v-slot:append>
+              <v-tooltip text="Firebase user email for email/password authentication.">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>
@@ -297,11 +411,15 @@ const testInfluxDB = async () => {
             </template>
           </v-text-field>
         </v-col>
-        <v-col cols="12" md="3">
-          <v-text-field v-model="systemSettings.influxdbBucket" 
-            label="InfluxDB Bucket">
+        <v-col cols="12" md="6">
+          <v-text-field v-model="systemSettings.firebasePassword" 
+            placeholder="password123"
+            label="Firebase Password"
+            type="password"
+            variant="outlined"
+            hide-details="auto">
             <template v-slot:append>
-              <v-tooltip text="InfluxDB bucket name for data storage">
+              <v-tooltip text="Firebase user password for email/password authentication.">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>
@@ -309,11 +427,14 @@ const testInfluxDB = async () => {
             </template>
           </v-text-field>
         </v-col>
+      </v-row>
+
+      <v-row v-if="systemSettings.firebaseDatabaseEnabled">
         <v-col cols="12" md="3">
-          <v-text-field v-model.number="systemSettings.influxdbSendInterval" 
+          <v-text-field v-model.number="systemSettings.firebaseSendInterval" 
             label="Send Interval (seconds)" type="number" min="1" max="300">
             <template v-slot:append>
-              <v-tooltip text="How often to send data to InfluxDB (1-300 seconds)">
+              <v-tooltip text="How often to send data to Firebase (1-300 seconds)">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>
@@ -321,12 +442,9 @@ const testInfluxDB = async () => {
             </template>
           </v-text-field>
         </v-col>
-      </v-row>
-
-      <v-row>
         <v-col cols="12" md="3">
-          <v-btn color="info" variant="outlined" class="mt-2" @click="testInfluxDB">
-            Test InfluxDB Connection
+          <v-btn color="info" variant="outlined" class="mt-2" @click="testFirebase">
+            Test Firebase Connection
           </v-btn>
         </v-col>
       </v-row>
