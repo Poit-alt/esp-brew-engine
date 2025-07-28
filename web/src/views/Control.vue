@@ -879,7 +879,7 @@ const labelTargetTemp = computed(() => {
                     </div>
                     <div class="text-h6">
                       <span v-if="sensor.isConnected">
-                        {{ sensor.currentTemp.toFixed(1) }}°{{ appStore.tempUnit || 'C' }}
+                        {{ sensor.currentTemp.toFixed(1) }}{{ appStore.tempUnit || '°C' }}
                       </span>
                       <span v-else class="text-error">
                         Disconnected

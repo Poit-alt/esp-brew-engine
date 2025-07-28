@@ -148,6 +148,7 @@
   "mashSchedules": {
     "name": "Name",
     "is_boil": "Kochplan",
+    "is_boil_info": "Aktivieren für Kochpläne (100°C+).<br>Verwendet Koch-PID-Einstellungen und Kochheizungen.<br><br>Deaktivieren für Maischpläne (niedrigere Temperaturen).<br>Verwendet Maisch-PID-Einstellungen.<br><br>Wenn deaktiviert, erkennt das System automatisch Kochmodus bei 100°C.",
     "mashSchedule": "Maisch-/Kochplan",
     "max_schedules_reached": "Es können nur {0} gespeichert werden!",
     "steps": "Schritte",
