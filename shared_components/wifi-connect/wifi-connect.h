@@ -48,6 +48,7 @@ private:
 
     EventGroupHandle_t s_wifi_event_group; // FreeRTOS event group to signal when we are connected
     int s_retry_num = 0;
+    volatile bool connection_failed = false; // Simple flag for interrupt-safe signaling
     esp_netif_t *sta_netif = NULL;
     SettingsManager *settingsManager;
 

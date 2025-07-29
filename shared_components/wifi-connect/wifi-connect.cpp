@@ -143,18 +143,32 @@ void WiFiConnect::wifi_event_handler(void *arg, esp_event_base_t event_base, int
     // }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        ESP_LOGI(TAG, "Disconnected");
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-        esp_wifi_connect();
-        xEventGroupClearBits(instance->s_wifi_event_group, WIFI_CONNECTED_BIT);
+        instance->s_retry_num++;
+        ESP_LOGI(TAG, "Disconnected (attempt %d/10)", instance->s_retry_num);
+        
+        if (instance->s_retry_num < 10) {
+            // Continue retrying - don't use vTaskDelay in event handler
+            esp_wifi_connect();
+        } else {
+            // After 10 failed attempts, set simple flag (interrupt-safe)
+            ESP_LOGW(TAG, "WiFi connection failed after 10 attempts, setting failure flag");
+            instance->connection_failed = true;
+        }
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
 
+        // Reset retry counter on successful connection
+        instance->s_retry_num = 0;
+        ESP_LOGI(TAG, "WiFi connected successfully, retry counter reset");
+
         string ipAddr;
         ipAddr = inet_ntoa(event->ip_info.ip);
         instance->gotIP(ipAddr);
+
+        // Signal successful connection
+        xEventGroupSetBits(instance->s_wifi_event_group, WIFI_CONNECTED_BIT);
 
         if (instance->setTime)
         {
@@ -166,6 +180,10 @@ void WiFiConnect::wifi_event_handler(void *arg, esp_event_base_t event_base, int
 
 void WiFiConnect::wifi_init_sta(void)
 {
+    // Reset retry counter and failure flag when starting station mode
+    this->s_retry_num = 0;
+    this->connection_failed = false;
+    ESP_LOGI(TAG, "Starting WiFi station mode, retry counter and flags reset");
 
     this->s_wifi_event_group = xEventGroupCreate();
 
@@ -198,23 +216,49 @@ void WiFiConnect::wifi_init_sta(void)
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-    EventBits_t bits = xEventGroupWaitBits(this->s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-        ESP_LOGI(TAG, "Connected to ap ssid:%s password:%s", this->ssid.c_str(), this->password.c_str());
+    /* Wait for connection or failure using a polling approach to avoid event group issues */
+    ESP_LOGI(TAG, "Waiting for WiFi connection or failure...");
+    
+    // Poll for connection status with timeout
+    int wait_time = 0;
+    const int max_wait_time = 60000; // 60 seconds max wait
+    const int poll_interval = 100;   // 100ms poll interval
+    
+    while (wait_time < max_wait_time) {
+        // Check if connection succeeded
+        EventBits_t bits = xEventGroupGetBits(this->s_wifi_event_group);
+        if (bits & WIFI_CONNECTED_BIT) {
+            ESP_LOGI(TAG, "Connected to ap ssid:%s password:%s", this->ssid.c_str(), this->password.c_str());
+            break;
+        }
+        
+        // Check if connection failed using our interrupt-safe flag
+        if (this->connection_failed) {
+            ESP_LOGI(TAG, "Failed to connect to ssid:%s, password:%s", this->ssid.c_str(), this->password.c_str());
+            
+            ESP_LOGW(TAG, "Switching to AP mode after %d failed attempts", this->s_retry_num);
+            
+            // Stop current WiFi
+            esp_wifi_stop();
+            
+            // Enable AP mode and save settings
+            this->enableAP = true;
+            this->saveSettings();
+            
+            // Start AP mode
+            this->wifi_init_softap();
+            
+            ESP_LOGI(TAG, "Switched to AP mode. Connect to SSID: %s", this->Hostname.c_str());
+            break;
+        }
+        
+        // Wait a bit before checking again
+        vTaskDelay(pdMS_TO_TICKS(poll_interval));
+        wait_time += poll_interval;
     }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-        ESP_LOGI(TAG, "Failed to connect to ssid:%s, password:%s", this->ssid.c_str(), this->password.c_str());
-    }
-    else
-    {
-        ESP_LOGE("WifiConnect", "UNEXPECTED EVENT");
+    
+    if (wait_time >= max_wait_time) {
+        ESP_LOGW(TAG, "WiFi connection timeout after %d ms", max_wait_time);
     }
 
     /* The event will not be processed after unregister */
@@ -242,7 +286,7 @@ void WiFiConnect::wifi_init_softap(void)
 
     wifi_config_t wifi_config = {};
 
-    strcpy((char *)wifi_config.ap.ssid, this->ssid.c_str());
+    strcpy((char *)wifi_config.ap.ssid, this->Hostname.c_str());
     strcpy((char *)wifi_config.ap.password, this->password.c_str());
     wifi_config.ap.channel = this->apChannel;
     wifi_config.ap.max_connection = 10;
@@ -264,7 +308,7 @@ void WiFiConnect::wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wifi Access Point finished. ssid:%s password:%s channel:%d", this->ssid.c_str(), this->password.c_str(), this->apChannel);
+    ESP_LOGI(TAG, "Wifi Access Point finished. ssid:%s password:%s channel:%d", this->Hostname.c_str(), this->password.c_str(), this->apChannel);
 }
 
 json WiFiConnect::Scan()

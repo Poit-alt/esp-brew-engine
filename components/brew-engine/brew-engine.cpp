@@ -330,16 +330,29 @@ void BrewEngine::saveSystemSettingsJson(const json &config)
 	}
 	
 	// Auto-disable Firebase database if in AP mode (no internet access)
+	// TEMPORARILY DISABLED FOR DEBUGGING - to test if this is causing the graph issue
+	/*
 	if (this->GetWifiSettingsJson) {
-		json wifiSettings = this->GetWifiSettingsJson();
-		if (!wifiSettings["enableAP"].is_null() && wifiSettings["enableAP"].is_boolean() && wifiSettings["enableAP"] == true) {
-			if (this->firebaseDatabaseEnabled) {
-				ESP_LOGW(TAG, "Auto-disabling Firebase database logging: device is in AP mode (no internet access)");
-				this->firebaseDatabaseEnabled = false;
-				this->settingsManager->Write("fbDbEnabled", false);
+		try {
+			json wifiSettings = this->GetWifiSettingsJson();
+			if (!wifiSettings.is_null() && !wifiSettings["enableAP"].is_null() && wifiSettings["enableAP"].is_boolean() && wifiSettings["enableAP"] == true) {
+				if (this->firebaseDatabaseEnabled) {
+					ESP_LOGW(TAG, "Auto-disabling Firebase database logging: device is in AP mode (no internet access)");
+					this->firebaseDatabaseEnabled = false;
+					// Try to save the setting, but don't fail if it doesn't work
+					try {
+						this->settingsManager->Write("fbDbEnabled", false);
+					} catch (const std::exception& e) {
+						ESP_LOGW(TAG, "Failed to save Firebase database disabled setting: %s", e.what());
+					}
+				}
 			}
+		} catch (const std::exception& e) {
+			ESP_LOGW(TAG, "Error checking WiFi settings for AP mode: %s", e.what());
 		}
 	}
+	*/
+	ESP_LOGI(TAG, "AP mode auto-disable temporarily disabled for debugging");
 	
 	if (!config["temperatureScale"].is_null() && config["temperatureScale"].is_number())
 	{
