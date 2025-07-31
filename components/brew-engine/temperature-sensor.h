@@ -49,6 +49,14 @@ public:
         jSensor["compensateRelative"] = this->compensateRelative;
         jSensor["lastTemp"] = (double)((int)(this->lastTemp * 10)) / 10; // round float to 0.1 for display
         jSensor["sensorType"] = this->sensorType;
+        
+        // Include CS pin for RTD sensors
+        if (this->sensorType == SENSOR_PT100 || this->sensorType == SENSOR_PT1000) {
+            int csPin = (int)(this->id - 0x31865000);
+            if (csPin >= 0 && csPin < 256) { // Valid GPIO range
+                jSensor["csPin"] = csPin;
+            }
+        }
 
         return jSensor;
     };

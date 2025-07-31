@@ -29,7 +29,6 @@ const systemSettings = ref<ISystemSettings>({
   spiMosiPin: 23,
   spiMisoPin: 19,
   spiClkPin: 18,
-  spiCsPin: 5,
 });
 
 // is same as enum TemperatureScale, but this wel never change, converting enum to options would be wastefull
@@ -503,17 +502,6 @@ const testFirebase = async () => {
           <v-text-field v-model.number="systemSettings.spiClkPin" label="SPI Clock Pin">
             <template v-slot:append>
               <v-tooltip text="SPI Clock pin for MAX31865">
-                <template v-slot:activator="{ props }">
-                  <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
-                </template>
-              </v-tooltip>
-            </template>
-          </v-text-field>
-        </v-col>
-        <v-col cols="12" md="3">
-          <v-text-field v-model.number="systemSettings.spiCsPin" label="SPI CS Pin">
-            <template v-slot:append>
-              <v-tooltip text="SPI Chip Select pin for MAX31865">
                 <template v-slot:activator="{ props }">
                   <v-icon size="small" v-bind="props">{{ mdiHelp }}</v-icon>
                 </template>

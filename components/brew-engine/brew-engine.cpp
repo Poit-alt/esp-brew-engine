@@ -832,6 +832,17 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 	this->skipTempLoop = true;
 	vTaskDelay(pdMS_TO_TICKS(2000));
 
+	// First pass: collect CS pin changes for RTD sensors
+	struct CsPinChange {
+		uint64_t oldSensorId;
+		uint64_t newSensorId;
+		int newCsPin;
+		TemperatureSensor *sensor;
+		json sensorData;
+	};
+	
+	vector<CsPinChange> csPinChanges;
+	
 	// update running data
 	for (auto &el : jTempSensors.items())
 	{
@@ -853,35 +864,193 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 			ESP_LOGI(TAG, "Updating Sensor %llu", sensorId);
 			// update it
 			TemperatureSensor *sensor = it->second;
-			sensor->name = jSensor["name"];
-			sensor->color = jSensor["color"];
-
-			if (!jSensor["useForControl"].is_null() && jSensor["useForControl"].is_boolean())
+			
+			// Check if this is an RTD sensor with a CS pin change
+			bool hasCsPinChange = false;
+			if ((sensor->sensorType == SENSOR_PT100 || sensor->sensorType == SENSOR_PT1000) && 
+				!jSensor["csPin"].is_null() && jSensor["csPin"].is_number_integer())
 			{
-				sensor->useForControl = jSensor["useForControl"];
-			}
-
-			if (!jSensor["show"].is_null() && jSensor["show"].is_boolean())
-			{
-				sensor->show = jSensor["show"];
-
-				if (!sensor->show)
+				int currentCsPin = (int)(sensorId - 0x31865000);
+				int newCsPin = jSensor["csPin"];
+				
+				if (currentCsPin != newCsPin && newCsPin >= 0 && newCsPin < GPIO_NUM_MAX)
 				{
-					// when show is disabled we also remove it from current, so it doesn't showup anymore
-					this->currentTemperatures.erase(sensorId);
+					ESP_LOGI(TAG, "RTD sensor %s CS pin change detected: %d -> %d", sensor->name.c_str(), currentCsPin, newCsPin);
+					
+					// Check if new CS pin is already in use
+					uint64_t newSensorId = 0x31865000 + newCsPin;
+					bool pinInUse = false;
+					
+					// Check existing sensors
+					if (this->sensors.find(newSensorId) != this->sensors.end())
+					{
+						pinInUse = true;
+					}
+					
+					// Check other pending changes
+					for (const auto &change : csPinChanges)
+					{
+						if (change.newSensorId == newSensorId)
+						{
+							pinInUse = true;
+							break;
+						}
+					}
+					
+					if (pinInUse)
+					{
+						ESP_LOGE(TAG, "CS pin %d is already in use by another RTD sensor", newCsPin);
+					}
+					else
+					{
+						// Queue the CS pin change
+						CsPinChange change;
+						change.oldSensorId = sensorId;
+						change.newSensorId = newSensorId;
+						change.newCsPin = newCsPin;
+						change.sensor = sensor;
+						change.sensorData = jSensor;
+						csPinChanges.push_back(change);
+						hasCsPinChange = true;
+					}
 				}
 			}
-
-			if (!jSensor["compensateAbsolute"].is_null() && jSensor["compensateAbsolute"].is_number())
+			
+			// Update other sensor properties (skip if CS pin change is queued)
+			if (!hasCsPinChange)
 			{
-				sensor->compensateAbsolute = (float)jSensor["compensateAbsolute"];
-			}
+				sensor->name = jSensor["name"];
+				sensor->color = jSensor["color"];
 
-			if (!jSensor["compensateRelative"].is_null() && jSensor["compensateRelative"].is_number())
-			{
-				sensor->compensateRelative = (float)jSensor["compensateRelative"];
+				if (!jSensor["useForControl"].is_null() && jSensor["useForControl"].is_boolean())
+				{
+					sensor->useForControl = jSensor["useForControl"];
+				}
+
+				if (!jSensor["show"].is_null() && jSensor["show"].is_boolean())
+				{
+					sensor->show = jSensor["show"];
+
+					if (!sensor->show)
+					{
+						// when show is disabled we also remove it from current, so it doesn't showup anymore
+						this->currentTemperatures.erase(sensorId);
+					}
+				}
+
+				if (!jSensor["compensateAbsolute"].is_null() && jSensor["compensateAbsolute"].is_number())
+				{
+					sensor->compensateAbsolute = (float)jSensor["compensateAbsolute"];
+				}
+
+				if (!jSensor["compensateRelative"].is_null() && jSensor["compensateRelative"].is_number())
+				{
+					sensor->compensateRelative = (float)jSensor["compensateRelative"];
+				}
 			}
 		}
+	}
+	
+	// Second pass: apply CS pin changes
+	for (const auto &change : csPinChanges)
+	{
+		ESP_LOGI(TAG, "Applying CS pin change for sensor %llu: CS pin %d", change.oldSensorId, change.newCsPin);
+		
+		TemperatureSensor *sensor = change.sensor;
+		
+		// Clean up old RTD hardware
+		for (auto rtdIt = this->rtdSensors.begin(); rtdIt != this->rtdSensors.end(); ++rtdIt)
+		{
+			if (*rtdIt != nullptr && memcmp(&(sensor->max31865Handle), *rtdIt, sizeof(max31865_t)) == 0)
+			{
+				if ((*rtdIt)->spi != nullptr)
+				{
+					spi_bus_remove_device((*rtdIt)->spi);
+				}
+				delete *rtdIt;
+				this->rtdSensors.erase(rtdIt);
+				this->rtdSensorCount--;
+				break;
+			}
+		}
+		
+		// Update sensor ID and reinitialize hardware
+		sensor->id = change.newSensorId;
+		memset(&sensor->max31865Handle, 0, sizeof(max31865_t));
+		
+		// Try to initialize with new CS pin
+		max31865_t *rtd_sensor = new max31865_t;
+		esp_err_t ret = max31865_init_desc(rtd_sensor, SPI2_HOST, change.newCsPin);
+		
+		bool hardwareSuccess = false;
+		if (ret == ESP_OK)
+		{
+			ret = max31865_set_config(rtd_sensor, true, 1, false, false, 0, true, true, 0, 0xFFFF);
+			if (ret == ESP_OK)
+			{
+				sensor->max31865Handle = *rtd_sensor;
+				sensor->connected = true;
+				sensor->consecutiveFailures = 0;
+				this->rtdSensors.push_back(rtd_sensor);
+				this->rtdSensorCount++;
+				hardwareSuccess = true;
+				
+				ESP_LOGI(TAG, "RTD sensor %s successfully moved to CS pin %d", sensor->name.c_str(), change.newCsPin);
+			}
+			else
+			{
+				ESP_LOGE(TAG, "Failed to configure RTD sensor on new CS pin %d: %s", change.newCsPin, esp_err_to_name(ret));
+				delete rtd_sensor;
+			}
+		}
+		else
+		{
+			ESP_LOGE(TAG, "Failed to initialize RTD sensor on new CS pin %d: %s", change.newCsPin, esp_err_to_name(ret));
+			delete rtd_sensor;
+		}
+		
+		if (!hardwareSuccess)
+		{
+			sensor->connected = false;
+			// Revert sensor ID on hardware failure
+			sensor->id = change.oldSensorId;
+		}
+		
+		// Update sensor properties
+		auto jSensor = change.sensorData;
+		sensor->name = jSensor["name"];
+		sensor->color = jSensor["color"];
+
+		if (!jSensor["useForControl"].is_null() && jSensor["useForControl"].is_boolean())
+		{
+			sensor->useForControl = jSensor["useForControl"];
+		}
+
+		if (!jSensor["show"].is_null() && jSensor["show"].is_boolean())
+		{
+			sensor->show = jSensor["show"];
+
+			if (!sensor->show)
+			{
+				// when show is disabled we also remove it from current, so it doesn't showup anymore
+				this->currentTemperatures.erase(sensor->id);
+			}
+		}
+
+		if (!jSensor["compensateAbsolute"].is_null() && jSensor["compensateAbsolute"].is_number())
+		{
+			sensor->compensateAbsolute = (float)jSensor["compensateAbsolute"];
+		}
+
+		if (!jSensor["compensateRelative"].is_null() && jSensor["compensateRelative"].is_number())
+		{
+			sensor->compensateRelative = (float)jSensor["compensateRelative"];
+		}
+		
+		// Update sensor mappings
+		this->sensors.erase(change.oldSensorId);
+		this->currentTemperatures.erase(change.oldSensorId);
+		this->sensors.insert_or_assign(sensor->id, sensor);
 	}
 
 	// We also need to delete sensors that are no longer in the list
@@ -891,6 +1060,25 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 	{
 		uint64_t sensorId = sensor->id;
 		string stringId = to_string(sensorId); // json doesn't support unit64 so in out json id is string
+		
+		// Check if this sensor was involved in a CS pin change
+		bool wasCsPinChanged = false;
+		for (const auto &change : csPinChanges)
+		{
+			if (change.sensor == sensor)
+			{
+				wasCsPinChanged = true;
+				break;
+			}
+		}
+		
+		// If this sensor had its CS pin changed, it should be preserved
+		if (wasCsPinChanged)
+		{
+			ESP_LOGI(TAG, "Preserving sensor %llu (had CS pin change)", sensorId);
+			continue;
+		}
+		
 		auto foundSensor = std::find_if(jTempSensors.begin(), jTempSensors.end(), [&stringId](const json &x)
 										{
 											auto it = x.find("id");
