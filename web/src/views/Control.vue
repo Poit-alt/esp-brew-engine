@@ -18,6 +18,7 @@ import { Line } from "vue-chartjs";
 import { useI18n } from "vue-i18n";
 import BoostStatus from "@/enums/BoostStatus";
 import { mdiThermometer } from "@mdi/js";
+import TemperatureGauge from "@/components/TemperatureGauge.vue";
 const { t } = useI18n({ useScope: "global" });
 
 const webConn = inject<WebConn>("webConn");
@@ -844,7 +845,7 @@ const labelTargetTemp = computed(() => {
         <Line v-if="chartInitDone && chartData" :options="chartOptions" :data="chartData" />
       </v-row>
       
-      <!-- Sensor Status Display -->
+      <!-- Temperature Gauges Display -->
       <v-row v-if="currentSensorStatus.length > 0" class="mb-4">
         <v-col cols="12">
           <v-card variant="outlined">
@@ -853,7 +854,7 @@ const labelTargetTemp = computed(() => {
               Temperature Sensors
             </v-card-title>
             <v-card-text>
-              <v-row>
+              <v-row justify="center">
                 <v-col 
                   v-for="sensor in currentSensorStatus" 
                   :key="sensor.id"
@@ -861,30 +862,29 @@ const labelTargetTemp = computed(() => {
                   sm="6" 
                   md="4" 
                   lg="3"
+                  class="d-flex justify-center"
                 >
+                  <div v-if="sensor.isConnected" class="sensor-gauge-wrapper">
+                    <TemperatureGauge
+                      :current-temperature="sensor.currentTemp"
+                      :min-temp="appStore.temperatureScale === TemperatureScale.Fahrenheit ? 32 : 0"
+                      :max-temp="appStore.temperatureScale === TemperatureScale.Fahrenheit ? 212 : 100"
+                      :unit="appStore.temperatureScale === TemperatureScale.Fahrenheit ? 'F' : 'C'"
+                      :sensor-id="sensor.id"
+                      :sensor-name="sensor.name"
+                      :last-update="sensor.timeSinceUpdate"
+                    />
+                  </div>
                   <v-card 
-                    :color="sensor.isConnected ? 'surface-variant' : 'error'" 
+                    v-else
+                    color="error" 
                     variant="tonal"
-                    class="pa-3"
+                    class="pa-3 disconnected-sensor"
+                    style="min-height: 300px; display: flex; align-items: center; justify-content: center; flex-direction: column;"
                   >
-                    <div class="d-flex align-center mb-2">
-                      <v-chip 
-                        :color="sensor.color" 
-                        size="small" 
-                        class="mr-2"
-                      >
-                        ●
-                      </v-chip>
-                      <span class="text-body-2 font-weight-medium">{{ sensor.name }}</span>
-                    </div>
-                    <div class="text-h6">
-                      <span v-if="sensor.isConnected">
-                        {{ sensor.currentTemp.toFixed(1) }}{{ appStore.tempUnit || '°C' }}
-                      </span>
-                      <span v-else class="text-error">
-                        Disconnected
-                      </span>
-                    </div>
+                    <v-icon size="48" class="mb-2">{{ mdiThermometer }}</v-icon>
+                    <div class="text-h6 mb-2">{{ sensor.name }}</div>
+                    <div class="text-error">Disconnected</div>
                     <div class="text-caption text-medium-emphasis">
                       {{ sensor.timeSinceUpdate }}
                     </div>
@@ -997,3 +997,24 @@ const labelTargetTemp = computed(() => {
     </v-form>
   </v-container>
 </template>
+
+<style scoped>
+.sensor-gauge-wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.disconnected-sensor {
+  max-width: 200px;
+}
+
+/* Responsive adjustments for gauges */
+@media (max-width: 960px) {
+  .sensor-gauge-wrapper {
+    margin-bottom: 20px;
+  }
+}
+
+</style>
