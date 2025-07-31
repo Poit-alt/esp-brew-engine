@@ -780,11 +780,11 @@ onMounted(() => {
   // atm only used to render te schedule at the current time
   setStartDateNow();
 
-  // Use longer polling interval (5s) to reduce network load in Access Point mode
-  // This helps prevent connection timeouts that cause the graph to disappear
+  // Use faster polling interval (1s) for responsive temperature updates
+  // This provides near real-time temperature monitoring
   intervalId.value = setInterval(() => {
     getData();
-  }, 5000);
+  }, 1000);
 
   initChart();
 });

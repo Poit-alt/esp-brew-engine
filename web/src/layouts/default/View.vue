@@ -1,7 +1,8 @@
 <script lang="ts" setup>
-import { mdiAltimeter, mdiChartLine, mdiCookieSettingsOutline, mdiFullscreen, mdiFullscreenExit, mdiHeatingCoil, mdiImport, mdiKnob, mdiReceiptTextClock, mdiThermometer, mdiThermometerLines, mdiWifi, mdiWrenchCogOutline } from "@mdi/js";
-import { ref } from "vue";
+import { mdiAltimeter, mdiChartLine, mdiCookieSettingsOutline, mdiFullscreen, mdiFullscreenExit, mdiHeatingCoil, mdiImport, mdiKnob, mdiReceiptTextClock, mdiThermometer, mdiThermometerLines, mdiWifi, mdiWrenchCogOutline, mdiMemory, mdiSpeedometer } from "@mdi/js";
+import { ref, onMounted, onBeforeUnmount, inject } from "vue";
 import { useI18n } from "vue-i18n";
+import WebConn from '@/helpers/webConn';
 const { t } = useI18n({ useScope: "global" });
 
 const drawer = ref(true);
@@ -28,6 +29,13 @@ const linksSettings = ref([
 const version = ref<string>(import.meta.env.VITE_APP_VERSION);
 
 const fullscreen = ref<boolean>(false);
+const webConn = inject<WebConn>("webConn");
+
+const systemInfo = ref<any>({
+  memoryUsagePercent: 0,
+  cpuUsagePercent: 0
+});
+let systemInfoInterval: NodeJS.Timeout;
 
 if (import.meta.env.MODE === "development") {
   version.value = `${import.meta.env.VITE_APP_VERSION}_dev`;
@@ -50,6 +58,32 @@ const exitFullscreen = () => {
   document.exitFullscreen();
   fullscreen.value = false;
 };
+
+const getSystemInfo = async () => {
+  try {
+    const requestData = {
+      command: "Data",
+      data: {}
+    };
+    const result = await webConn?.doPostRequest(requestData);
+    if (result?.success && result.data.systemInfo) {
+      systemInfo.value = result.data.systemInfo;
+    }
+  } catch (error) {
+    console.error('Failed to get system info:', error);
+  }
+};
+
+onMounted(() => {
+  getSystemInfo();
+  systemInfoInterval = setInterval(getSystemInfo, 2000); // Update every 2 seconds
+});
+
+onBeforeUnmount(() => {
+  if (systemInfoInterval) {
+    clearInterval(systemInfoInterval);
+  }
+});
 </script>
 
 <template>
@@ -58,7 +92,31 @@ const exitFullscreen = () => {
       <v-app-bar-nav-icon @click="drawer = !drawer" />
       <v-toolbar-title>ESP Brew Engine</v-toolbar-title>
       <v-spacer />
-      <h5 class="mr-10">Version: {{ version }}</h5>
+      
+      <!-- System Info -->
+      <div class="d-flex align-center mr-4">
+        <v-tooltip bottom>
+          <template v-slot:activator="{ props }">
+            <div class="d-flex align-center mr-3" v-bind="props">
+              <v-icon size="small" class="mr-1">{{ mdiSpeedometer }}</v-icon>
+              <span class="text-caption">{{ systemInfo.cpuUsagePercent }}%</span>
+            </div>
+          </template>
+          <span>CPU Usage</span>
+        </v-tooltip>
+        
+        <v-tooltip bottom>
+          <template v-slot:activator="{ props }">
+            <div class="d-flex align-center" v-bind="props">
+              <v-icon size="small" class="mr-1">{{ mdiMemory }}</v-icon>
+              <span class="text-caption">{{ systemInfo.memoryUsagePercent }}%</span>
+            </div>
+          </template>
+          <span>Memory Usage</span>
+        </v-tooltip>
+      </div>
+      
+      <h5 class="mr-4">Version: {{ version }}</h5>
 
       <v-btn icon v-if="!fullscreen" @click="enterFullscreen">
         <v-icon>{{ mdiFullscreen }}</v-icon>
