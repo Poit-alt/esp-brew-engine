@@ -92,6 +92,7 @@ private:
     void initOneWire();
     void detectRtdTemperatureSensors();
     void initRtdSensors();
+    void initNtcTemperatureSensors();
     void cleanupRtdSensors();
     bool reinitializeRtdSensor(TemperatureSensor *sensor);
     void initMqtt();

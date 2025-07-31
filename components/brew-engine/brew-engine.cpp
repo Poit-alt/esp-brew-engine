@@ -65,17 +65,7 @@ void BrewEngine::Init()
 	// read other settings like maishschedules and pid
 	this->readSettings();
 
-	this->readTempSensorSettings();
-
-	this->initOneWire();
-
-	this->detectOnewireTemperatureSensors();
-
-	this->initRtdSensors();
-
-	this->detectRtdTemperatureSensors();
-
-	// Initialize ADC for NTC sensors
+	// Initialize ADC for NTC sensors BEFORE loading temperature sensor settings
 	this->adcInitialized = false;
 	this->adc1_handle = nullptr;
 	this->adc1_cali_handle = nullptr;
@@ -128,6 +118,19 @@ void BrewEngine::Init()
 	{
 		ESP_LOGE(TAG, "Failed to initialize ADC: %s", esp_err_to_name(adc_err));
 	}
+
+	this->readTempSensorSettings();
+
+	// Initialize NTC sensors loaded from settings
+	this->initNtcTemperatureSensors();
+
+	this->initOneWire();
+
+	this->detectOnewireTemperatureSensors();
+
+	this->initRtdSensors();
+
+	this->detectRtdTemperatureSensors();
 
 	this->initMqtt();
 
@@ -2702,6 +2705,80 @@ bool BrewEngine::reinitializeRtdSensor(TemperatureSensor *sensor)
 	return false;
 }
 
+void BrewEngine::initNtcTemperatureSensors()
+{
+	ESP_LOGI(TAG, "Initializing NTC temperature sensors from settings");
+	
+	if (!this->adcInitialized)
+	{
+		ESP_LOGE(TAG, "ADC not initialized, cannot initialize NTC sensors");
+		return;
+	}
+	
+	int ntcSensorCount = 0;
+	
+	// Initialize all NTC sensors loaded from settings
+	for (auto &[sensorId, sensor] : this->sensors)
+	{
+		if (sensor->sensorType == SENSOR_NTC)
+		{
+			// Extract analog pin from sensor ID
+			int analogPin = (int)(sensorId - 0x4E544300); // "NTC" base ID
+			
+			// Validate analog pin range
+			if (analogPin < 1 || analogPin > 10)
+			{
+				ESP_LOGW(TAG, "Invalid analog pin %d for NTC sensor [%s], skipping", analogPin, sensor->name.c_str());
+				sensor->connected = false;
+				continue;
+			}
+			
+			// Map GPIO pin to ADC channel (ESP32-S3 mapping)
+			adc_channel_t adc_channel;
+			switch (analogPin)
+			{
+				case 1: adc_channel = ADC_CHANNEL_0; break;
+				case 2: adc_channel = ADC_CHANNEL_1; break;
+				case 3: adc_channel = ADC_CHANNEL_2; break;
+				case 4: adc_channel = ADC_CHANNEL_3; break;
+				case 5: adc_channel = ADC_CHANNEL_4; break;
+				case 6: adc_channel = ADC_CHANNEL_5; break;
+				case 7: adc_channel = ADC_CHANNEL_6; break;
+				case 8: adc_channel = ADC_CHANNEL_7; break;
+				case 9: adc_channel = ADC_CHANNEL_8; break;
+				case 10: adc_channel = ADC_CHANNEL_9; break;
+				default:
+					ESP_LOGW(TAG, "Unsupported analog pin %d for NTC sensor [%s], skipping", analogPin, sensor->name.c_str());
+					sensor->connected = false;
+					continue;
+			}
+			
+			// Test ADC channel by taking a reading
+			int test_reading;
+			esp_err_t test_err = adc_oneshot_read(this->adc1_handle, adc_channel, &test_reading);
+			if (test_err == ESP_OK)
+			{
+				// ADC channel is working, mark sensor as ready for temperature reading
+				sensor->connected = false; // Will be set to true on first successful temperature reading
+				sensor->consecutiveFailures = 0;
+				sensor->analogPin = analogPin; // Ensure analog pin is set correctly
+				ntcSensorCount++;
+				
+				ESP_LOGI(TAG, "NTC sensor [%s] initialized on analog pin %d (ADC channel %d), test reading: %d", 
+						sensor->name.c_str(), analogPin, adc_channel, test_reading);
+			}
+			else
+			{
+				ESP_LOGW(TAG, "Failed to read from ADC channel %d for NTC sensor [%s]: %s", 
+						adc_channel, sensor->name.c_str(), esp_err_to_name(test_err));
+				sensor->connected = false;
+			}
+		}
+	}
+	
+	ESP_LOGI(TAG, "NTC sensor initialization completed, %d NTC sensor(s) found", ntcSensorCount);
+}
+
 void BrewEngine::start()
 {
 	// don't start if we are already running
@@ -3126,8 +3203,11 @@ void BrewEngine::readLoop(void *arg)
 			float temperature;
 			string stringId = std::to_string(key);
 
-			// Skip disconnected sensors, except for RTD sensors which we want to retry
-			if (!sensor->connected && sensor->sensorType != SENSOR_PT100 && sensor->sensorType != SENSOR_PT1000)
+			// Skip disconnected sensors, except for RTD and NTC sensors which we want to retry
+			if (!sensor->connected && 
+				sensor->sensorType != SENSOR_PT100 && 
+				sensor->sensorType != SENSOR_PT1000 && 
+				sensor->sensorType != SENSOR_NTC)
 			{
 				continue;
 			}
@@ -3357,9 +3437,22 @@ void BrewEngine::readLoop(void *arg)
 				float v_supply = 3300.0f; // 3.3V in mV
 				float v_adc = (float)voltage_mv;
 				
-				if (v_adc <= v_supply * 0.01f) // Avoid division by zero
+				// Check for voltage ranges that indicate disconnection or short circuit
+				if (v_adc <= 10.0f) // Very low voltage - possible short circuit
 				{
 					ESP_LOGW(TAG, "NTC sensor [%s] voltage too low (%.1fmV), possible short circuit", stringId.c_str(), v_adc);
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+				
+				if (v_adc >= v_supply * 0.95f) // Very high voltage - possible open circuit (disconnected)
+				{
+					ESP_LOGW(TAG, "NTC sensor [%s] voltage too high (%.1fmV), possible open circuit or disconnection", stringId.c_str(), v_adc);
 					sensor->connected = false;
 					sensor->lastTemp = -999.0;
 					if (sensor->show)
@@ -3396,8 +3489,9 @@ void BrewEngine::readLoop(void *arg)
 				// Convert to Celsius
 				temperature = temp_kelvin - 273.15f;
 				
-				// Basic sanity check - temperature should be reasonable
-				if (temperature < -50.0f || temperature > 200.0f)
+				// Sanity check - temperature should be reasonable for brewing applications
+				// Allow wider range to permit sensor recovery and different applications
+				if (temperature < -40.0f || temperature > 150.0f)
 				{
 					ESP_LOGW(TAG, "NTC sensor [%s] reading out of range: %.1f°C (R=%.1f ohms, V=%.1fmV)", 
 							stringId.c_str(), temperature, ntc_resistance, v_adc);
