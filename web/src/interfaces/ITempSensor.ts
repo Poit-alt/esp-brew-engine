@@ -9,4 +9,5 @@ export interface ITempSensor {
   compensateRelative: number;
   lastTemp: number;
   sensorType: number; // 0 = DS18B20, 1 = PT100, 2 = PT1000
+  csPin?: number; // CS pin for RTD sensors (optional, only for RTD sensors)
 }

@@ -14,6 +14,7 @@ const tableHeaders = ref<Array<any>>([
   { title: t("tempSettings.id"), key: "id", align: "start" },
   { title: t("tempSettings.name"), key: "name", align: "start" },
   { title: "Type", key: "sensorType", align: "start" },
+  { title: "CS Pin", key: "csPin", align: "start" },
   { title: t("tempSettings.color"), key: "color", align: "start" },
   { title: t("tempSettings.compensate_abs"), key: "compensateAbsolute", align: "start" },
   { title: t("tempSettings.compensate_rel"), key: "compensateRelative", align: "start" },
@@ -41,6 +42,7 @@ const defaultSensor: ITempSensor = {
   compensateRelative: 1,
   lastTemp: 0,
   sensorType: 0,
+  csPin: 5,
 };
 
 const sensorTypes = [
@@ -217,7 +219,7 @@ const closeAddRtdDialog = () => {
             <v-row>
               <v-col cols="12">
                 <p class="text-body-2 mb-3">
-                  <strong>Note:</strong> Make sure RTD sensors are enabled in System Settings and SPI pins are configured before adding sensors.
+                  <strong>Note:</strong> Make sure RTD sensors are enabled in System Settings and SPI MOSI/MISO/CLK pins are configured before adding sensors. Each sensor needs its own CS pin.
                 </p>
                 <v-btn color="primary" @click="dialogAddRtd = true">
                   <v-icon class="mr-1">{{ mdiPlus }}</v-icon>
@@ -257,6 +259,16 @@ const closeAddRtdDialog = () => {
                       </v-col>
                       <v-col cols="12" md="6">
                         <v-select v-model="editedItem.sensorType" :items="sensorTypes" label="Sensor Type" />
+                      </v-col>
+                    </v-row>
+                    <v-row v-if="editedItem.sensorType === 1 || editedItem.sensorType === 2">
+                      <v-col cols="12" md="6">
+                        <v-text-field v-model.number="editedItem.csPin" label="SPI CS Pin" type="number" hint="GPIO pin for Chip Select" />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-alert type="warning" variant="tonal" density="compact">
+                          Changing CS pin requires sensor restart
+                        </v-alert>
                       </v-col>
                     </v-row>
                     <v-row>
@@ -362,7 +374,7 @@ const closeAddRtdDialog = () => {
                           <div class="text-body-2">
                             <strong>Wiring:</strong><br>
                             • Connect MAX31865 CS to GPIO {{ newRtdSensor.csPin }}<br>
-                            • MOSI, MISO, CLK pins set in System Settings
+                            • MOSI, MISO, CLK pins configured in System Settings
                           </div>
                         </v-alert>
                       </v-col>
@@ -410,6 +422,12 @@ const closeAddRtdDialog = () => {
           <v-chip :color="item.sensorType === 0 ? 'blue' : item.sensorType === 1 ? 'green' : 'orange'" size="small">
             {{ item.sensorType === 0 ? 'DS18B20' : item.sensorType === 1 ? 'PT100' : 'PT1000' }}
           </v-chip>
+        </template>
+        <template v-slot:[`item.csPin`]="{ item }">
+          <span v-if="item.sensorType === 1 || item.sensorType === 2">
+            {{ item.csPin || 'N/A' }}
+          </span>
+          <span v-else class="text-grey">-</span>
         </template>
         <template v-slot:[`item.useForControl`]="{ item }">
           <v-tooltip text="Check to use this sensor for heating control">

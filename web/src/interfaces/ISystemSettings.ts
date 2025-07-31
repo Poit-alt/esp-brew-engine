@@ -20,5 +20,4 @@ export interface ISystemSettings {
   spiMosiPin: number;
   spiMisoPin: number;
   spiClkPin: number;
-  spiCsPin: number;
 }
