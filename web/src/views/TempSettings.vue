@@ -14,7 +14,7 @@ const tableHeaders = ref<Array<any>>([
   { title: t("tempSettings.id"), key: "id", align: "start" },
   { title: t("tempSettings.name"), key: "name", align: "start" },
   { title: "Type", key: "sensorType", align: "start" },
-  { title: "CS Pin", key: "csPin", align: "start" },
+  { title: "Pin", key: "sensorPin", align: "start" },
   { title: t("tempSettings.color"), key: "color", align: "start" },
   { title: t("tempSettings.compensate_abs"), key: "compensateAbsolute", align: "start" },
   { title: t("tempSettings.compensate_rel"), key: "compensateRelative", align: "start" },
@@ -43,12 +43,16 @@ const defaultSensor: ITempSensor = {
   lastTemp: 0,
   sensorType: 0,
   csPin: 5,
+  analogPin: 1,
+  ntcResistance: 10000,
+  dividerResistor: 10000,
 };
 
 const sensorTypes = [
   { title: "DS18B20", value: 0 },
   { title: "PT100", value: 1 },
   { title: "PT1000", value: 2 },
+  { title: "NTC", value: 3 },
 ];
 
 const editedItem = ref<ITempSensor>(defaultSensor);
@@ -67,6 +71,18 @@ const rtdSensorTypes = [
   { title: "PT100", value: 1 },
   { title: "PT1000", value: 2 },
 ];
+
+// NTC sensor management
+const dialogAddNtc = ref<boolean>(false);
+const newNtcSensor = ref({
+  name: "NTC Sensor",
+  analogPin: 1,
+  sensorType: 3, // NTC
+  ntcResistance: 10000,
+  dividerResistor: 10000,
+  useForControl: false,
+  show: true
+});
 
 const getData = async () => {
   const requestData = {
@@ -183,6 +199,46 @@ const closeAddRtdDialog = () => {
     show: true
   };
 };
+
+const addNtcSensor = async () => {
+  const requestData = {
+    command: "AddNtcSensor",
+    data: {
+      name: newNtcSensor.value.name,
+      analogPin: newNtcSensor.value.analogPin,
+      sensorType: newNtcSensor.value.sensorType,
+      ntcResistance: newNtcSensor.value.ntcResistance,
+      dividerResistor: newNtcSensor.value.dividerResistor,
+      useForControl: newNtcSensor.value.useForControl,
+      show: newNtcSensor.value.show
+    }
+  };
+
+  const result = await webConn?.doPostRequest(requestData);
+  if (result?.success) {
+    dialogAddNtc.value = false;
+    await getData(); // Refresh the sensor list
+    alertType.value = "success";
+    alert.value = "NTC sensor added successfully";
+  } else {
+    alertType.value = "error";
+    alert.value = result?.message || "Failed to add NTC sensor";
+  }
+};
+
+const closeAddNtcDialog = () => {
+  dialogAddNtc.value = false;
+  // Reset form
+  newNtcSensor.value = {
+    name: "NTC Sensor",
+    analogPin: 1,
+    sensorType: 3,
+    ntcResistance: 10000,
+    dividerResistor: 10000,
+    useForControl: false,
+    show: true
+  };
+};
 </script>
 
 <template>
@@ -231,6 +287,34 @@ const closeAddRtdDialog = () => {
         </v-card>
       </v-col>
     </v-row>
+
+    <!-- NTC Sensor Management Section -->
+    <v-row class="mb-4">
+      <v-col cols="12">
+        <v-card>
+          <v-card-title>
+            <v-icon class="mr-2">{{ mdiThermometer }}</v-icon>
+            NTC Temperature Sensors
+          </v-card-title>
+          <v-card-subtitle>
+            Add analog NTC temperature sensors with voltage divider configuration
+          </v-card-subtitle>
+          <v-card-text>
+            <v-row>
+              <v-col cols="12">
+                <p class="text-body-2 mb-3">
+                  <strong>Note:</strong> NTC sensors use analog pins for temperature measurement. Configure the NTC resistance and voltage divider resistor values according to your hardware setup.
+                </p>
+                <v-btn color="primary" @click="dialogAddNtc = true">
+                  <v-icon class="mr-1">{{ mdiPlus }}</v-icon>
+                  Add NTC Sensor
+                </v-btn>
+              </v-col>
+            </v-row>
+          </v-card-text>
+        </v-card>
+      </v-col>
+    </v-row>
     
     <v-form fast-fail @submit.prevent>
       <v-data-table :headers="tableHeaders" :items="tempSensors" density="compact" item-value="name">
@@ -269,6 +353,17 @@ const closeAddRtdDialog = () => {
                         <v-alert type="warning" variant="tonal" density="compact">
                           Changing CS pin requires sensor restart
                         </v-alert>
+                      </v-col>
+                    </v-row>
+                    <v-row v-if="editedItem.sensorType === 3">
+                      <v-col cols="12" md="4">
+                        <v-text-field v-model.number="editedItem.analogPin" label="Analog Pin" type="number" hint="GPIO pin for analog reading" />
+                      </v-col>
+                      <v-col cols="12" md="4">
+                        <v-text-field v-model.number="editedItem.ntcResistance" label="NTC Resistance (Ω)" type="number" hint="NTC resistance at 25°C" />
+                      </v-col>
+                      <v-col cols="12" md="4">
+                        <v-text-field v-model.number="editedItem.dividerResistor" label="Divider Resistor (Ω)" type="number" hint="Voltage divider resistor value" />
                       </v-col>
                     </v-row>
                     <v-row>
@@ -412,6 +507,97 @@ const closeAddRtdDialog = () => {
                 </v-card-actions>
               </v-card>
             </v-dialog>
+            
+            <!-- Add NTC Sensor Dialog -->
+            <v-dialog v-model="dialogAddNtc" max-width="600px">
+              <v-card>
+                <v-toolbar density="compact" color="primary">
+                  <v-toolbar-title>Add NTC Sensor</v-toolbar-title>
+                </v-toolbar>
+                
+                <v-card-text class="pt-4">
+                  <v-container>
+                    <v-row>
+                      <v-col cols="12" md="6">
+                        <v-text-field 
+                          v-model="newNtcSensor.name" 
+                          label="Sensor Name"
+                          hint="Give your NTC sensor a descriptive name"
+                          persistent-hint />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-text-field 
+                          v-model.number="newNtcSensor.analogPin" 
+                          type="number"
+                          label="Analog Pin"
+                          hint="GPIO pin number for analog reading"
+                          persistent-hint />
+                      </v-col>
+                    </v-row>
+                    
+                    <v-row>
+                      <v-col cols="12" md="6">
+                        <v-text-field 
+                          v-model.number="newNtcSensor.ntcResistance" 
+                          type="number"
+                          label="NTC Resistance (Ω)"
+                          hint="NTC resistance at 25°C (e.g., 10000)"
+                          persistent-hint />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-text-field 
+                          v-model.number="newNtcSensor.dividerResistor" 
+                          type="number"
+                          label="Divider Resistor (Ω)"
+                          hint="Voltage divider resistor value (e.g., 10000)"
+                          persistent-hint />
+                      </v-col>
+                    </v-row>
+                    
+                    <v-row>
+                      <v-col cols="12">
+                        <v-alert type="info" variant="tonal" class="mb-3">
+                          <div class="text-body-2">
+                            <strong>Wiring:</strong><br>
+                            • Connect 3.3V → {{ newNtcSensor.dividerResistor }}Ω → GPIO {{ newNtcSensor.analogPin }} → NTC ({{ newNtcSensor.ntcResistance }}Ω) → GND<br>
+                            • ESP32-S3 ADC1 supported pins: 1-10
+                          </div>
+                        </v-alert>
+                      </v-col>
+                    </v-row>
+                    
+                    <v-row>
+                      <v-col cols="12" md="6">
+                        <v-switch 
+                          v-model="newNtcSensor.show" 
+                          label="Show on Chart"
+                          color="green"
+                          hint="Display sensor readings on temperature chart"
+                          persistent-hint />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <v-switch 
+                          v-model="newNtcSensor.useForControl" 
+                          label="Use for Heating Control"
+                          color="red"
+                          hint="Use this sensor for PID heating control"
+                          persistent-hint />
+                      </v-col>
+                    </v-row>
+                  </v-container>
+                </v-card-text>
+                
+                <v-card-actions>
+                  <v-spacer />
+                  <v-btn color="grey" variant="text" @click="closeAddNtcDialog">
+                    Cancel
+                  </v-btn>
+                  <v-btn color="primary" variant="text" @click="addNtcSensor">
+                    Add NTC Sensor
+                  </v-btn>
+                </v-card-actions>
+              </v-card>
+            </v-dialog>
           </v-toolbar>
         </template>
         <template v-slot:[`item.actions`]="{ item }">
@@ -419,13 +605,16 @@ const closeAddRtdDialog = () => {
           <v-icon size="small" @click="openDeleteDialog(item)" :icon="mdiDelete" />
         </template>
         <template v-slot:[`item.sensorType`]="{ item }">
-          <v-chip :color="item.sensorType === 0 ? 'blue' : item.sensorType === 1 ? 'green' : 'orange'" size="small">
-            {{ item.sensorType === 0 ? 'DS18B20' : item.sensorType === 1 ? 'PT100' : 'PT1000' }}
+          <v-chip :color="item.sensorType === 0 ? 'blue' : item.sensorType === 1 ? 'green' : item.sensorType === 2 ? 'orange' : 'purple'" size="small">
+            {{ item.sensorType === 0 ? 'DS18B20' : item.sensorType === 1 ? 'PT100' : item.sensorType === 2 ? 'PT1000' : 'NTC' }}
           </v-chip>
         </template>
-        <template v-slot:[`item.csPin`]="{ item }">
+        <template v-slot:[`item.sensorPin`]="{ item }">
           <span v-if="item.sensorType === 1 || item.sensorType === 2">
-            {{ item.csPin || 'N/A' }}
+            CS: {{ item.csPin || 'N/A' }}
+          </span>
+          <span v-else-if="item.sensorType === 3">
+            A{{ item.analogPin || 'N/A' }}
           </span>
           <span v-else class="text-grey">-</span>
         </template>

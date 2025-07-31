@@ -17,6 +17,9 @@
 #include "cJSON.h"
 #include "esp_ota_ops.h"
 #include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_system.h"
 
 #include <iostream>
@@ -195,6 +198,11 @@ private:
     std::vector<max31865_t*> rtdSensors;
     uint8_t rtdSensorCount;
     bool rtdSensorsEnabled;
+
+    // ADC configuration for NTC sensors
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_cali_handle_t adc1_cali_handle;
+    bool adcInitialized;
 
     uint8_t buzzerTime; // in seconds
 

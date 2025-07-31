@@ -12,7 +12,8 @@ using json = nlohmann::json;
 enum SensorType {
     SENSOR_DS18B20,
     SENSOR_PT100,
-    SENSOR_PT1000
+    SENSOR_PT1000,
+    SENSOR_NTC
 };
 
 class TemperatureSensor
@@ -32,6 +33,11 @@ public:
     // Sensor-specific handles
     ds18b20_device_handle_t ds18b20Handle;
     max31865_t max31865Handle;
+    
+    // NTC sensor configuration
+    int analogPin;          // GPIO pin for analog reading
+    float ntcResistance;    // NTC resistance at 25°C (in ohms)
+    float dividerResistor;  // Voltage divider resistor value (in ohms)
     
     // RTD sensor recovery tracking
     int consecutiveFailures;
@@ -56,6 +62,16 @@ public:
             if (csPin >= 0 && csPin < 256) { // Valid GPIO range
                 jSensor["csPin"] = csPin;
             }
+        }
+        
+        // Include NTC sensor configuration
+        if (this->sensorType == SENSOR_NTC) {
+            int analogPin = (int)(this->id - 0x4E544300); // "NTC" base ID + pin
+            if (analogPin >= 0 && analogPin < 256) { // Valid GPIO range
+                jSensor["analogPin"] = analogPin;
+            }
+            jSensor["ntcResistance"] = this->ntcResistance;
+            jSensor["dividerResistor"] = this->dividerResistor;
         }
 
         return jSensor;
@@ -122,6 +138,39 @@ public:
         // Initialize hardware handles to safe defaults
         this->ds18b20Handle = nullptr;
         memset(&this->max31865Handle, 0, sizeof(this->max31865Handle));
+        
+        // Initialize NTC configuration from JSON or defaults
+        if (this->sensorType == SENSOR_NTC)
+        {
+            // Extract analog pin from sensor ID
+            this->analogPin = (int)(this->id - 0x4E544300);
+            
+            // Load NTC configuration from JSON
+            if (jsonData.contains("ntcResistance") && !jsonData["ntcResistance"].is_null() && jsonData["ntcResistance"].is_number())
+            {
+                this->ntcResistance = (float)jsonData["ntcResistance"];
+            }
+            else
+            {
+                this->ntcResistance = 10000.0f; // 10k NTC default
+            }
+            
+            if (jsonData.contains("dividerResistor") && !jsonData["dividerResistor"].is_null() && jsonData["dividerResistor"].is_number())
+            {
+                this->dividerResistor = (float)jsonData["dividerResistor"];
+            }
+            else
+            {
+                this->dividerResistor = 10000.0f; // 10k voltage divider default
+            }
+        }
+        else
+        {
+            // Initialize NTC configuration to safe defaults for non-NTC sensors
+            this->analogPin = 0;
+            this->ntcResistance = 10000.0f;
+            this->dividerResistor = 10000.0f;
+        }
     };
 
 protected:
