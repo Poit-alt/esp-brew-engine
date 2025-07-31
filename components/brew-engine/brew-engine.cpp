@@ -75,6 +75,60 @@ void BrewEngine::Init()
 
 	this->detectRtdTemperatureSensors();
 
+	// Initialize ADC for NTC sensors
+	this->adcInitialized = false;
+	this->adc1_handle = nullptr;
+	this->adc1_cali_handle = nullptr;
+	
+	// Configure ADC1 oneshot unit
+	adc_oneshot_unit_init_cfg_t init_config1 = {};
+	init_config1.unit_id = ADC_UNIT_1;
+	init_config1.clk_src = ADC_RTC_CLK_SRC_DEFAULT;
+	init_config1.ulp_mode = ADC_ULP_MODE_DISABLE;
+	
+	esp_err_t adc_err = adc_oneshot_new_unit(&init_config1, &this->adc1_handle);
+	if (adc_err == ESP_OK)
+	{
+		// Configure channels for NTC sensors with attenuation for 3.3V range
+		adc_oneshot_chan_cfg_t config = {};
+		config.atten = ADC_ATTEN_DB_12; // Use non-deprecated constant
+		config.bitwidth = ADC_BITWIDTH_DEFAULT;
+		
+		// Configure common analog pins for ESP32-S3
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_0, &config); // GPIO1
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_1, &config); // GPIO2
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_2, &config); // GPIO3
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_3, &config); // GPIO4
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_4, &config); // GPIO5
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_5, &config); // GPIO6
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_6, &config); // GPIO7
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_7, &config); // GPIO8
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_8, &config); // GPIO9
+		adc_oneshot_config_channel(this->adc1_handle, ADC_CHANNEL_9, &config); // GPIO10
+		
+		// Initialize calibration
+		adc_cali_curve_fitting_config_t cali_config = {};
+		cali_config.unit_id = ADC_UNIT_1;
+		cali_config.atten = ADC_ATTEN_DB_12;
+		cali_config.bitwidth = ADC_BITWIDTH_DEFAULT;
+		
+		esp_err_t cali_err = adc_cali_create_scheme_curve_fitting(&cali_config, &this->adc1_cali_handle);
+		if (cali_err == ESP_OK)
+		{
+			this->adcInitialized = true;
+			ESP_LOGI(TAG, "ADC initialized for NTC sensors with calibration");
+		}
+		else
+		{
+			ESP_LOGW(TAG, "ADC calibration initialization failed: %s, proceeding without calibration", esp_err_to_name(cali_err));
+			this->adcInitialized = true; // Still allow ADC operation without calibration
+		}
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Failed to initialize ADC: %s", esp_err_to_name(adc_err));
+	}
+
 	this->initMqtt();
 
 	this->initFirebase();
@@ -832,7 +886,7 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 	this->skipTempLoop = true;
 	vTaskDelay(pdMS_TO_TICKS(2000));
 
-	// First pass: collect CS pin changes for RTD sensors
+	// First pass: collect CS pin changes for RTD sensors and analog pin changes for NTC sensors
 	struct CsPinChange {
 		uint64_t oldSensorId;
 		uint64_t newSensorId;
@@ -841,7 +895,16 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 		json sensorData;
 	};
 	
+	struct AnalogPinChange {
+		uint64_t oldSensorId;
+		uint64_t newSensorId;
+		int newAnalogPin;
+		TemperatureSensor *sensor;
+		json sensorData;
+	};
+	
 	vector<CsPinChange> csPinChanges;
+	vector<AnalogPinChange> analogPinChanges;
 	
 	// update running data
 	for (auto &el : jTempSensors.items())
@@ -916,8 +979,59 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 				}
 			}
 			
-			// Update other sensor properties (skip if CS pin change is queued)
-			if (!hasCsPinChange)
+			// Check if this is an NTC sensor with an analog pin change
+			bool hasAnalogPinChange = false;
+			if (sensor->sensorType == SENSOR_NTC && 
+				!jSensor["analogPin"].is_null() && jSensor["analogPin"].is_number_integer())
+			{
+				int currentAnalogPin = (int)(sensorId - 0x4E544300); // "NTC" base ID
+				int newAnalogPin = jSensor["analogPin"];
+				
+				if (currentAnalogPin != newAnalogPin && newAnalogPin >= 0 && newAnalogPin < GPIO_NUM_MAX)
+				{
+					ESP_LOGI(TAG, "NTC sensor %s analog pin change detected: %d -> %d", sensor->name.c_str(), currentAnalogPin, newAnalogPin);
+					
+					// Check if new analog pin is already in use by another NTC sensor
+					uint64_t newSensorId = 0x4E544300 + newAnalogPin;
+					bool pinInUse = false;
+					
+					// Check existing sensors
+					if (this->sensors.find(newSensorId) != this->sensors.end())
+					{
+						pinInUse = true;
+					}
+					
+					// Check other pending changes
+					for (const auto &change : analogPinChanges)
+					{
+						if (change.newSensorId == newSensorId)
+						{
+							pinInUse = true;
+							break;
+						}
+					}
+					
+					if (pinInUse)
+					{
+						ESP_LOGE(TAG, "Analog pin %d is already in use by another NTC sensor", newAnalogPin);
+					}
+					else
+					{
+						// Queue the analog pin change
+						AnalogPinChange change;
+						change.oldSensorId = sensorId;
+						change.newSensorId = newSensorId;
+						change.newAnalogPin = newAnalogPin;
+						change.sensor = sensor;
+						change.sensorData = jSensor;
+						analogPinChanges.push_back(change);
+						hasAnalogPinChange = true;
+					}
+				}
+			}
+			
+			// Update other sensor properties (skip if CS pin change or analog pin change is queued)
+			if (!hasCsPinChange && !hasAnalogPinChange)
 			{
 				sensor->name = jSensor["name"];
 				sensor->color = jSensor["color"];
@@ -1052,6 +1166,67 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 		this->currentTemperatures.erase(change.oldSensorId);
 		this->sensors.insert_or_assign(sensor->id, sensor);
 	}
+	
+	// Third pass: apply analog pin changes for NTC sensors
+	for (const auto &change : analogPinChanges)
+	{
+		ESP_LOGI(TAG, "Applying analog pin change for NTC sensor %llu: analog pin %d", change.oldSensorId, change.newAnalogPin);
+		
+		TemperatureSensor *sensor = change.sensor;
+		
+		// Update sensor ID (no hardware cleanup needed for NTC sensors)
+		sensor->id = change.newSensorId;
+		sensor->analogPin = change.newAnalogPin;
+		
+		// Update NTC configuration from JSON data
+		auto jSensor = change.sensorData;
+		if (!jSensor["ntcResistance"].is_null() && jSensor["ntcResistance"].is_number())
+		{
+			sensor->ntcResistance = (float)jSensor["ntcResistance"];
+		}
+		
+		if (!jSensor["dividerResistor"].is_null() && jSensor["dividerResistor"].is_number())
+		{
+			sensor->dividerResistor = (float)jSensor["dividerResistor"];
+		}
+		
+		// Update other sensor properties
+		sensor->name = jSensor["name"];
+		sensor->color = jSensor["color"];
+
+		if (!jSensor["useForControl"].is_null() && jSensor["useForControl"].is_boolean())
+		{
+			sensor->useForControl = jSensor["useForControl"];
+		}
+
+		if (!jSensor["show"].is_null() && jSensor["show"].is_boolean())
+		{
+			sensor->show = jSensor["show"];
+
+			if (!sensor->show)
+			{
+				// when show is disabled we also remove it from current, so it doesn't showup anymore
+				this->currentTemperatures.erase(sensor->id);
+			}
+		}
+
+		if (!jSensor["compensateAbsolute"].is_null() && jSensor["compensateAbsolute"].is_number())
+		{
+			sensor->compensateAbsolute = (float)jSensor["compensateAbsolute"];
+		}
+
+		if (!jSensor["compensateRelative"].is_null() && jSensor["compensateRelative"].is_number())
+		{
+			sensor->compensateRelative = (float)jSensor["compensateRelative"];
+		}
+		
+		// Update sensor mappings
+		this->sensors.erase(change.oldSensorId);
+		this->currentTemperatures.erase(change.oldSensorId);
+		this->sensors.insert_or_assign(sensor->id, sensor);
+		
+		ESP_LOGI(TAG, "NTC sensor %s successfully moved to analog pin %d", sensor->name.c_str(), change.newAnalogPin);
+	}
 
 	// We also need to delete sensors that are no longer in the list
 	vector<uint64_t> sensorsToDelete;
@@ -1061,7 +1236,7 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 		uint64_t sensorId = sensor->id;
 		string stringId = to_string(sensorId); // json doesn't support unit64 so in out json id is string
 		
-		// Check if this sensor was involved in a CS pin change
+		// Check if this sensor was involved in a CS pin change or analog pin change
 		bool wasCsPinChanged = false;
 		for (const auto &change : csPinChanges)
 		{
@@ -1072,10 +1247,20 @@ void BrewEngine::saveTempSensorSettings(const json &jTempSensors)
 			}
 		}
 		
-		// If this sensor had its CS pin changed, it should be preserved
-		if (wasCsPinChanged)
+		bool wasAnalogPinChanged = false;
+		for (const auto &change : analogPinChanges)
 		{
-			ESP_LOGI(TAG, "Preserving sensor %llu (had CS pin change)", sensorId);
+			if (change.sensor == sensor)
+			{
+				wasAnalogPinChanged = true;
+				break;
+			}
+		}
+		
+		// If this sensor had its CS pin or analog pin changed, it should be preserved
+		if (wasCsPinChanged || wasAnalogPinChanged)
+		{
+			ESP_LOGI(TAG, "Preserving sensor %llu (had pin change)", sensorId);
 			continue;
 		}
 		
@@ -3092,6 +3277,150 @@ void BrewEngine::readLoop(void *arg)
 					sensor->consecutiveFailures = 0;
 				}
 			}
+			else if (sensor->sensorType == SENSOR_NTC)
+			{
+				// NTC sensor reading via ADC
+				if (!instance->adcInitialized)
+				{
+					ESP_LOGW(TAG, "ADC not initialized for NTC sensor [%s], skipping", stringId.c_str());
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+
+				// Get ADC channel from GPIO pin (ESP32-S3 mapping)
+				adc_channel_t adc_channel;
+				switch (sensor->analogPin)
+				{
+					case 1: adc_channel = ADC_CHANNEL_0; break;
+					case 2: adc_channel = ADC_CHANNEL_1; break;
+					case 3: adc_channel = ADC_CHANNEL_2; break;
+					case 4: adc_channel = ADC_CHANNEL_3; break;
+					case 5: adc_channel = ADC_CHANNEL_4; break;
+					case 6: adc_channel = ADC_CHANNEL_5; break;
+					case 7: adc_channel = ADC_CHANNEL_6; break;
+					case 8: adc_channel = ADC_CHANNEL_7; break;
+					case 9: adc_channel = ADC_CHANNEL_8; break;
+					case 10: adc_channel = ADC_CHANNEL_9; break;
+					default:
+						ESP_LOGW(TAG, "Invalid analog pin %d for NTC sensor [%s] (supported: 1-10)", sensor->analogPin, stringId.c_str());
+						sensor->connected = false;
+						sensor->lastTemp = -999.0;
+						if (sensor->show)
+						{
+							instance->currentTemperatures.insert_or_assign(key, -999.0);
+						}
+						continue;
+				}
+
+				// Read ADC value
+				int adc_reading;
+				esp_err_t read_err = adc_oneshot_read(instance->adc1_handle, adc_channel, &adc_reading);
+				if (read_err != ESP_OK)
+				{
+					ESP_LOGW(TAG, "Error reading ADC for NTC sensor [%s]: %s", stringId.c_str(), esp_err_to_name(read_err));
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+
+				// Convert ADC reading to voltage
+				int voltage_mv = 0;
+				if (instance->adc1_cali_handle != nullptr)
+				{
+					esp_err_t cali_err = adc_cali_raw_to_voltage(instance->adc1_cali_handle, adc_reading, &voltage_mv);
+					if (cali_err != ESP_OK)
+					{
+						ESP_LOGW(TAG, "ADC calibration failed for NTC sensor [%s], using raw conversion", stringId.c_str());
+						// Fallback: approximate conversion for 12-bit ADC with 3.3V reference
+						voltage_mv = (adc_reading * 3300) / 4095;
+					}
+				}
+				else
+				{
+					// Fallback: approximate conversion for 12-bit ADC with 3.3V reference
+					voltage_mv = (adc_reading * 3300) / 4095;
+				}
+				
+				// Calculate NTC resistance using voltage divider
+				// Voltage divider: 3.3V -> NTC -> analogPin -> dividerResistor -> GND
+				// V_adc = V_supply * (R_divider / (R_ntc + R_divider))
+				// Solving for R_ntc: R_ntc = ((V_supply - V_adc) * R_divider) / V_adc
+				float v_supply = 3300.0f; // 3.3V in mV
+				float v_adc = (float)voltage_mv;
+				
+				if (v_adc <= v_supply * 0.01f) // Avoid division by zero
+				{
+					ESP_LOGW(TAG, "NTC sensor [%s] voltage too low (%.1fmV), possible short circuit", stringId.c_str(), v_adc);
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+				
+				float ntc_resistance = ((v_supply - v_adc) * sensor->dividerResistor) / v_adc;
+				
+				// Calculate temperature using simplified Steinhart-Hart equation
+				// For NTC thermistors: 1/T = 1/T0 + (1/B) * ln(R/R0)
+				// Where T0 = 298.15K (25°C), R0 = ntcResistance (at 25°C), B = 3950 (typical value)
+				float T0 = 298.15f; // 25°C in Kelvin
+				float B = 3950.0f;  // Beta coefficient (typical value for NTC thermistors)
+				float R0 = sensor->ntcResistance;
+				
+				if (ntc_resistance <= 0)
+				{
+					ESP_LOGW(TAG, "Invalid NTC resistance calculated for sensor [%s]: %.1f ohms", stringId.c_str(), ntc_resistance);
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+				
+				// Calculate temperature in Kelvin
+				float temp_kelvin = 1.0f / ((1.0f / T0) + (1.0f / B) * logf(ntc_resistance / R0));
+				
+				// Convert to Celsius
+				temperature = temp_kelvin - 273.15f;
+				
+				// Basic sanity check - temperature should be reasonable
+				if (temperature < -50.0f || temperature > 200.0f)
+				{
+					ESP_LOGW(TAG, "NTC sensor [%s] reading out of range: %.1f°C (R=%.1f ohms, V=%.1fmV)", 
+							stringId.c_str(), temperature, ntc_resistance, v_adc);
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+				
+				// Mark sensor as connected
+				if (!sensor->connected)
+				{
+					ESP_LOGI(TAG, "NTC sensor [%s] connected", stringId.c_str());
+				}
+				sensor->connected = true;
+				sensor->consecutiveFailures = 0;
+				
+				ESP_LOGD(TAG, "NTC sensor [%s]: ADC=%d, V=%.1fmV, R=%.1f ohms, T=%.1f°C", 
+						stringId.c_str(), adc_reading, v_adc, ntc_resistance, temperature);
+			}
 			else
 			{
 				ESP_LOGW(TAG, "Unknown sensor type for [%s], skipping", stringId.c_str());
@@ -4016,6 +4345,67 @@ string BrewEngine::processCommand(const string &payLoad)
 						ESP_LOGE(TAG, "Failed to initialize RTD sensor: %s", esp_err_to_name(ret));
 					}
 				}
+			}
+		}
+	}
+	else if (command == "AddNtcSensor")
+	{
+		string name = data["name"];
+		int analogPin = data["analogPin"];
+		int sensorType = data["sensorType"];
+		float ntcResistance = data["ntcResistance"];
+		float dividerResistor = data["dividerResistor"];
+		bool useForControl = data["useForControl"];
+		bool show = data["show"];
+		
+		// Generate unique ID for NTC sensor
+		uint64_t ntcSensorId = 0x4E544300 + analogPin; // "NTC" base ID + analog pin
+		
+		// Check if sensor already exists
+		if (this->sensors.find(ntcSensorId) != this->sensors.end())
+		{
+			success = false;
+			message = "NTC sensor with analog pin " + to_string(analogPin) + " already exists";
+		}
+		else
+		{
+			// Validate GPIO pin
+			if (analogPin < 0 || analogPin >= GPIO_NUM_MAX)
+			{
+				success = false;
+				message = "Invalid analog pin number: " + to_string(analogPin);
+			}
+			else
+			{
+				// Create temperature sensor object
+				auto sensor = new TemperatureSensor();
+				sensor->id = ntcSensorId;
+				sensor->name = name;
+				sensor->color = "#9C27B0"; // Purple for NTC
+				sensor->useForControl = useForControl;
+				sensor->show = show;
+				sensor->connected = true; // NTC sensors are always "connected" if properly wired
+				sensor->compensateAbsolute = 0;
+				sensor->compensateRelative = 1;
+				sensor->sensorType = (SensorType)sensorType;
+				sensor->analogPin = analogPin;
+				sensor->ntcResistance = ntcResistance;
+				sensor->dividerResistor = dividerResistor;
+				sensor->consecutiveFailures = 0;
+				
+				this->sensors.insert_or_assign(sensor->id, sensor);
+				
+				// Save sensor settings
+				json jSensors = json::array({});
+				for (auto const &[key, val] : this->sensors)
+				{
+					json jSensor = val->to_json();
+					jSensors.push_back(jSensor);
+				}
+				this->saveTempSensorSettings(jSensors);
+				
+				ESP_LOGI(TAG, "NTC sensor added successfully: %s (analog pin %d)", name.c_str(), analogPin);
+				message = "NTC sensor added successfully";
 			}
 		}
 	}
