@@ -140,7 +140,7 @@ void BrewEngine::Init()
 
 	this->run = true;
 
-	xTaskCreate(&this->readLoop, "readloop_task", 8192, this, 5, NULL);
+	xTaskCreate(&this->readLoop, "readloop_task", 16384, this, 5, NULL);
 
 	this->server = this->startWebserver();
 }
@@ -1707,67 +1707,102 @@ esp_err_t BrewEngine::authenticateWithEmailPassword()
         return ESP_ERR_INVALID_STATE;
     }
     
+    // Initialize all variables at the top to avoid goto initialization crossing
+    cJSON *json = NULL;
+    cJSON *email = NULL;
+    cJSON *password = NULL;
+    cJSON *return_secure_token = NULL;
+    char *json_string = NULL;
+    esp_http_client_handle_t client = NULL;
+    esp_http_client_config_t config = {};
+    esp_err_t err = ESP_FAIL;
+    int wlen = 0;
+    int content_length = 0;
+    int status_code = 0;
+    int total_read = 0;
+    
     char url[2200];
     char post_data[1024];
     char response_buffer[2048];
     
     memset(response_buffer, 0, sizeof(response_buffer));
+    memset(post_data, 0, sizeof(post_data));
     
     snprintf(url, sizeof(url), "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=%s", this->firebaseApiKey.c_str());
     
-    cJSON *json = cJSON_CreateObject();
-    cJSON *email = cJSON_CreateString(this->firebaseEmail.c_str());
-    cJSON *password = cJSON_CreateString(this->firebasePassword.c_str());
-    cJSON *return_secure_token = cJSON_CreateBool(true);
+    // Create JSON with proper error checking
+    json = cJSON_CreateObject();
+    if (json == NULL) {
+        ESP_LOGE(TAG, "Failed to create JSON object - out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    
+    email = cJSON_CreateString(this->firebaseEmail.c_str());
+    password = cJSON_CreateString(this->firebasePassword.c_str());
+    return_secure_token = cJSON_CreateBool(true);
+    
+    if (email == NULL || password == NULL || return_secure_token == NULL) {
+        ESP_LOGE(TAG, "Failed to create JSON fields - out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
     
     cJSON_AddItemToObject(json, "email", email);
     cJSON_AddItemToObject(json, "password", password);
     cJSON_AddItemToObject(json, "returnSecureToken", return_secure_token);
     
-    char *json_string = cJSON_Print(json);
+    json_string = cJSON_Print(json);
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to serialize JSON - out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
     strncpy(post_data, json_string, sizeof(post_data) - 1);
     post_data[sizeof(post_data) - 1] = '\0';
     
     ESP_LOGI(TAG, "Email/password auth URL: %s", url);
     ESP_LOGI(TAG, "Authenticating user: %s", this->firebaseEmail.c_str());
     
-    esp_http_client_config_t config = {};
     config.url = url;
     config.method = HTTP_METHOD_POST;
     config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 2048;
-    config.timeout_ms = 10000;
+    config.buffer_size = 4096;          // Increased for TLS operations
+    config.buffer_size_tx = 4096;       // Increased for TLS operations
+    config.timeout_ms = 15000;          // Increased timeout for crypto operations
+    config.max_redirection_count = 0;   // Disable redirects to reduce complexity
+    config.disable_auto_redirect = true;
     
-    esp_http_client_handle_t client = esp_http_client_init(&config);
+    client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, post_data, strlen(post_data));
     
-    esp_err_t err = esp_http_client_open(client, strlen(post_data));
+    err = esp_http_client_open(client, strlen(post_data));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        free(json_string);
-        cJSON_Delete(json);
-        return err;
+        goto cleanup;
     }
     
-    int wlen = esp_http_client_write(client, post_data, strlen(post_data));
+    wlen = esp_http_client_write(client, post_data, strlen(post_data));
     if (wlen < 0) {
         ESP_LOGE(TAG, "Failed to write request data");
-        esp_http_client_cleanup(client);
-        free(json_string);
-        cJSON_Delete(json);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto cleanup;
     }
     
-    int content_length = esp_http_client_fetch_headers(client);
-    int status_code = esp_http_client_get_status_code(client);
+    content_length = esp_http_client_fetch_headers(client);
+    status_code = esp_http_client_get_status_code(client);
     
     ESP_LOGI(TAG, "Email/password auth response status: %d, content_length: %d", status_code, content_length);
     
     // Read response data
-    int total_read = 0;
+    total_read = 0;
     if (content_length > 0) {
         total_read = esp_http_client_read(client, response_buffer, content_length);
     } else {
@@ -1779,8 +1814,6 @@ esp_err_t BrewEngine::authenticateWithEmailPassword()
         }
     }
     response_buffer[total_read] = '\0';
-    
-    esp_http_client_close(client);
     
     ESP_LOGI(TAG, "Response buffer content (%d bytes): %s", total_read, response_buffer);
     
@@ -1852,9 +1885,22 @@ esp_err_t BrewEngine::authenticateWithEmailPassword()
         err = ESP_FAIL;
     }
     
-    esp_http_client_cleanup(client);
-    free(json_string);
-    cJSON_Delete(json);
+cleanup:
+    // Proper cleanup with null checks to prevent double-free crashes
+    if (client) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        client = NULL;
+    }
+    if (json_string) {
+        free(json_string);
+        json_string = NULL;
+    }
+    if (json) {
+        cJSON_Delete(json);
+        json = NULL;
+    }
+    
     return err;
 }
 
@@ -1893,6 +1939,20 @@ esp_err_t BrewEngine::ensureFirebaseAuthenticated()
 {
     if (isFirebaseTokenValid()) {
         return ESP_OK;
+    }
+    
+    // Add delay to prevent resource contention during authentication
+    ESP_LOGI(TAG, "Authentication required - allowing system resources to stabilize...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Check available memory before attempting TLS operations
+    size_t free_heap = esp_get_free_heap_size();
+    size_t min_heap = esp_get_minimum_free_heap_size();
+    ESP_LOGI(TAG, "Pre-auth memory: %zu bytes free, %zu min", free_heap, min_heap);
+    
+    if (free_heap < 50000) {
+        ESP_LOGW(TAG, "Low memory (%zu bytes) - deferring authentication", free_heap);
+        return ESP_ERR_NO_MEM;
     }
     
     // Try to refresh using existing refresh token first
@@ -4897,8 +4957,13 @@ httpd_handle_t BrewEngine::startWebserver(void)
 	httpd_handle_t server = NULL;
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	// whiout this the esp crashed whitout a proper warning
-	config.stack_size = 20480;
+	config.stack_size = 32768;          // Increased from 20480 to prevent stack overflow
 	config.uri_match_fn = httpd_uri_match_wildcard;
+	config.max_open_sockets = 4;        // Reduce concurrent connections 
+	config.max_uri_handlers = 8;        // Limit URI handlers
+	config.max_resp_headers = 8;        // Limit response headers
+	config.recv_wait_timeout = 5;       // Reduce timeout to free resources faster
+	config.send_wait_timeout = 5;       // Reduce timeout to free resources faster
 
 	// Start the httpd server
 	ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
