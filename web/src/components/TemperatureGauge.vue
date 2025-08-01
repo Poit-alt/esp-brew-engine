@@ -1,7 +1,9 @@
 <template>
   <div class="temperature-gauge" :class="{ 'dark-theme': theme.current.value.dark }">
-    <div class="gauge-header">
-      <h3>{{ sensorId || 'TEMP' }}</h3>
+    <!-- Sensor name at top -->
+    <div v-if="sensorName" class="sensor-info">
+      <div class="sensor-name-display">{{ sensorName }}</div>
+      <div v-if="lastUpdate" class="last-update-display">{{ lastUpdate }}</div>
     </div>
 
     <div class="vertical-gauge-container">
@@ -89,17 +91,20 @@
             class="prediction-label-vertical"
             :style="{
               position: 'absolute',
-              left: '52px',
-              top: `${predictedPosition - 6}px`,
-              fontSize: '7px',
+              left: '46px',
+              top: predictionDirection === 'up' 
+                ? `${predictedPosition - 14}px` 
+                : `${predictedPosition + 6}px`,
+              fontSize: '6px',
               color: '#495057',
               background: 'rgba(255, 255, 255, 0.95)',
-              padding: '1px 3px',
-              borderRadius: '3px',
+              padding: '1px 2px',
+              borderRadius: '2px',
               whiteSpace: 'nowrap',
               zIndex: 22,
               transition: 'all 0.3s ease',
-              boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)'
+              boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)',
+              transform: 'translateX(-50%)'
             }"
           >
             {{ predictedTemperature.toFixed(1) }}°
@@ -113,11 +118,6 @@
           {{ currentTemperature.toFixed(1) }}°{{ unit }}
         </div>
         
-        <!-- Sensor name and last update -->
-        <div v-if="sensorName" class="sensor-info">
-          <div class="sensor-name-display">{{ sensorName }}</div>
-          <div v-if="lastUpdate" class="last-update-display">{{ lastUpdate }}</div>
-        </div>
         
         <!-- Time selector dropdown -->
         <div class="prediction-time-dropdown">
@@ -392,6 +392,7 @@ onMounted(() => {
   background: transparent;
   padding: 0;
   overflow: hidden;
+  flex: 1;
 }
 
 .gauge-and-prediction-wrapper {
@@ -530,7 +531,7 @@ onMounted(() => {
   background: transparent;
   border-radius: 8px;
   padding: 6px;
-  min-width: 80px;
+  min-width: 100px;
   text-align: center;
 }
 
@@ -541,6 +542,7 @@ onMounted(() => {
   margin-bottom: 6px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   letter-spacing: -1px;
+  white-space: nowrap;
 }
 
 .sensor-info {
@@ -554,6 +556,11 @@ onMounted(() => {
   color: #495057;
   margin-bottom: 2px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+  text-align: center;
 }
 
 .last-update-display {
@@ -561,6 +568,8 @@ onMounted(() => {
   color: #6c757d;
   font-style: italic;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  text-align: center;
+  width: 100%;
 }
 
 .trend-display {

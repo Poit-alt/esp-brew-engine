@@ -65,17 +65,7 @@ void BrewEngine::Init()
 	// read other settings like maishschedules and pid
 	this->readSettings();
 
-	this->readTempSensorSettings();
-
-	this->initOneWire();
-
-	this->detectOnewireTemperatureSensors();
-
-	this->initRtdSensors();
-
-	this->detectRtdTemperatureSensors();
-
-	// Initialize ADC for NTC sensors
+	// Initialize ADC for NTC sensors BEFORE loading temperature sensor settings
 	this->adcInitialized = false;
 	this->adc1_handle = nullptr;
 	this->adc1_cali_handle = nullptr;
@@ -129,6 +119,19 @@ void BrewEngine::Init()
 		ESP_LOGE(TAG, "Failed to initialize ADC: %s", esp_err_to_name(adc_err));
 	}
 
+	this->readTempSensorSettings();
+
+	// Initialize NTC sensors loaded from settings
+	this->initNtcTemperatureSensors();
+
+	this->initOneWire();
+
+	this->detectOnewireTemperatureSensors();
+
+	this->initRtdSensors();
+
+	this->detectRtdTemperatureSensors();
+
 	this->initMqtt();
 
 	this->initFirebase();
@@ -137,7 +140,7 @@ void BrewEngine::Init()
 
 	this->run = true;
 
-	xTaskCreate(&this->readLoop, "readloop_task", 8192, this, 5, NULL);
+	xTaskCreate(&this->readLoop, "readloop_task", 16384, this, 5, NULL);
 
 	this->server = this->startWebserver();
 }
@@ -1704,67 +1707,102 @@ esp_err_t BrewEngine::authenticateWithEmailPassword()
         return ESP_ERR_INVALID_STATE;
     }
     
+    // Initialize all variables at the top to avoid goto initialization crossing
+    cJSON *json = NULL;
+    cJSON *email = NULL;
+    cJSON *password = NULL;
+    cJSON *return_secure_token = NULL;
+    char *json_string = NULL;
+    esp_http_client_handle_t client = NULL;
+    esp_http_client_config_t config = {};
+    esp_err_t err = ESP_FAIL;
+    int wlen = 0;
+    int content_length = 0;
+    int status_code = 0;
+    int total_read = 0;
+    
     char url[2200];
     char post_data[1024];
     char response_buffer[2048];
     
     memset(response_buffer, 0, sizeof(response_buffer));
+    memset(post_data, 0, sizeof(post_data));
     
     snprintf(url, sizeof(url), "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=%s", this->firebaseApiKey.c_str());
     
-    cJSON *json = cJSON_CreateObject();
-    cJSON *email = cJSON_CreateString(this->firebaseEmail.c_str());
-    cJSON *password = cJSON_CreateString(this->firebasePassword.c_str());
-    cJSON *return_secure_token = cJSON_CreateBool(true);
+    // Create JSON with proper error checking
+    json = cJSON_CreateObject();
+    if (json == NULL) {
+        ESP_LOGE(TAG, "Failed to create JSON object - out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    
+    email = cJSON_CreateString(this->firebaseEmail.c_str());
+    password = cJSON_CreateString(this->firebasePassword.c_str());
+    return_secure_token = cJSON_CreateBool(true);
+    
+    if (email == NULL || password == NULL || return_secure_token == NULL) {
+        ESP_LOGE(TAG, "Failed to create JSON fields - out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
     
     cJSON_AddItemToObject(json, "email", email);
     cJSON_AddItemToObject(json, "password", password);
     cJSON_AddItemToObject(json, "returnSecureToken", return_secure_token);
     
-    char *json_string = cJSON_Print(json);
+    json_string = cJSON_Print(json);
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to serialize JSON - out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
     strncpy(post_data, json_string, sizeof(post_data) - 1);
     post_data[sizeof(post_data) - 1] = '\0';
     
     ESP_LOGI(TAG, "Email/password auth URL: %s", url);
     ESP_LOGI(TAG, "Authenticating user: %s", this->firebaseEmail.c_str());
     
-    esp_http_client_config_t config = {};
     config.url = url;
     config.method = HTTP_METHOD_POST;
     config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 2048;
-    config.timeout_ms = 10000;
+    config.buffer_size = 4096;          // Increased for TLS operations
+    config.buffer_size_tx = 4096;       // Increased for TLS operations
+    config.timeout_ms = 15000;          // Increased timeout for crypto operations
+    config.max_redirection_count = 0;   // Disable redirects to reduce complexity
+    config.disable_auto_redirect = true;
     
-    esp_http_client_handle_t client = esp_http_client_init(&config);
+    client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, post_data, strlen(post_data));
     
-    esp_err_t err = esp_http_client_open(client, strlen(post_data));
+    err = esp_http_client_open(client, strlen(post_data));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        free(json_string);
-        cJSON_Delete(json);
-        return err;
+        goto cleanup;
     }
     
-    int wlen = esp_http_client_write(client, post_data, strlen(post_data));
+    wlen = esp_http_client_write(client, post_data, strlen(post_data));
     if (wlen < 0) {
         ESP_LOGE(TAG, "Failed to write request data");
-        esp_http_client_cleanup(client);
-        free(json_string);
-        cJSON_Delete(json);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto cleanup;
     }
     
-    int content_length = esp_http_client_fetch_headers(client);
-    int status_code = esp_http_client_get_status_code(client);
+    content_length = esp_http_client_fetch_headers(client);
+    status_code = esp_http_client_get_status_code(client);
     
     ESP_LOGI(TAG, "Email/password auth response status: %d, content_length: %d", status_code, content_length);
     
     // Read response data
-    int total_read = 0;
+    total_read = 0;
     if (content_length > 0) {
         total_read = esp_http_client_read(client, response_buffer, content_length);
     } else {
@@ -1776,8 +1814,6 @@ esp_err_t BrewEngine::authenticateWithEmailPassword()
         }
     }
     response_buffer[total_read] = '\0';
-    
-    esp_http_client_close(client);
     
     ESP_LOGI(TAG, "Response buffer content (%d bytes): %s", total_read, response_buffer);
     
@@ -1849,9 +1885,22 @@ esp_err_t BrewEngine::authenticateWithEmailPassword()
         err = ESP_FAIL;
     }
     
-    esp_http_client_cleanup(client);
-    free(json_string);
-    cJSON_Delete(json);
+cleanup:
+    // Proper cleanup with null checks to prevent double-free crashes
+    if (client) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        client = NULL;
+    }
+    if (json_string) {
+        free(json_string);
+        json_string = NULL;
+    }
+    if (json) {
+        cJSON_Delete(json);
+        json = NULL;
+    }
+    
     return err;
 }
 
@@ -1890,6 +1939,20 @@ esp_err_t BrewEngine::ensureFirebaseAuthenticated()
 {
     if (isFirebaseTokenValid()) {
         return ESP_OK;
+    }
+    
+    // Add delay to prevent resource contention during authentication
+    ESP_LOGI(TAG, "Authentication required - allowing system resources to stabilize...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Check available memory before attempting TLS operations
+    size_t free_heap = esp_get_free_heap_size();
+    size_t min_heap = esp_get_minimum_free_heap_size();
+    ESP_LOGI(TAG, "Pre-auth memory: %zu bytes free, %zu min", free_heap, min_heap);
+    
+    if (free_heap < 50000) {
+        ESP_LOGW(TAG, "Low memory (%zu bytes) - deferring authentication", free_heap);
+        return ESP_ERR_NO_MEM;
     }
     
     // Try to refresh using existing refresh token first
@@ -2702,6 +2765,80 @@ bool BrewEngine::reinitializeRtdSensor(TemperatureSensor *sensor)
 	return false;
 }
 
+void BrewEngine::initNtcTemperatureSensors()
+{
+	ESP_LOGI(TAG, "Initializing NTC temperature sensors from settings");
+	
+	if (!this->adcInitialized)
+	{
+		ESP_LOGE(TAG, "ADC not initialized, cannot initialize NTC sensors");
+		return;
+	}
+	
+	int ntcSensorCount = 0;
+	
+	// Initialize all NTC sensors loaded from settings
+	for (auto &[sensorId, sensor] : this->sensors)
+	{
+		if (sensor->sensorType == SENSOR_NTC)
+		{
+			// Extract analog pin from sensor ID
+			int analogPin = (int)(sensorId - 0x4E544300); // "NTC" base ID
+			
+			// Validate analog pin range
+			if (analogPin < 1 || analogPin > 10)
+			{
+				ESP_LOGW(TAG, "Invalid analog pin %d for NTC sensor [%s], skipping", analogPin, sensor->name.c_str());
+				sensor->connected = false;
+				continue;
+			}
+			
+			// Map GPIO pin to ADC channel (ESP32-S3 mapping)
+			adc_channel_t adc_channel;
+			switch (analogPin)
+			{
+				case 1: adc_channel = ADC_CHANNEL_0; break;
+				case 2: adc_channel = ADC_CHANNEL_1; break;
+				case 3: adc_channel = ADC_CHANNEL_2; break;
+				case 4: adc_channel = ADC_CHANNEL_3; break;
+				case 5: adc_channel = ADC_CHANNEL_4; break;
+				case 6: adc_channel = ADC_CHANNEL_5; break;
+				case 7: adc_channel = ADC_CHANNEL_6; break;
+				case 8: adc_channel = ADC_CHANNEL_7; break;
+				case 9: adc_channel = ADC_CHANNEL_8; break;
+				case 10: adc_channel = ADC_CHANNEL_9; break;
+				default:
+					ESP_LOGW(TAG, "Unsupported analog pin %d for NTC sensor [%s], skipping", analogPin, sensor->name.c_str());
+					sensor->connected = false;
+					continue;
+			}
+			
+			// Test ADC channel by taking a reading
+			int test_reading;
+			esp_err_t test_err = adc_oneshot_read(this->adc1_handle, adc_channel, &test_reading);
+			if (test_err == ESP_OK)
+			{
+				// ADC channel is working, mark sensor as ready for temperature reading
+				sensor->connected = false; // Will be set to true on first successful temperature reading
+				sensor->consecutiveFailures = 0;
+				sensor->analogPin = analogPin; // Ensure analog pin is set correctly
+				ntcSensorCount++;
+				
+				ESP_LOGI(TAG, "NTC sensor [%s] initialized on analog pin %d (ADC channel %d), test reading: %d", 
+						sensor->name.c_str(), analogPin, adc_channel, test_reading);
+			}
+			else
+			{
+				ESP_LOGW(TAG, "Failed to read from ADC channel %d for NTC sensor [%s]: %s", 
+						adc_channel, sensor->name.c_str(), esp_err_to_name(test_err));
+				sensor->connected = false;
+			}
+		}
+	}
+	
+	ESP_LOGI(TAG, "NTC sensor initialization completed, %d NTC sensor(s) found", ntcSensorCount);
+}
+
 void BrewEngine::start()
 {
 	// don't start if we are already running
@@ -3126,8 +3263,11 @@ void BrewEngine::readLoop(void *arg)
 			float temperature;
 			string stringId = std::to_string(key);
 
-			// Skip disconnected sensors, except for RTD sensors which we want to retry
-			if (!sensor->connected && sensor->sensorType != SENSOR_PT100 && sensor->sensorType != SENSOR_PT1000)
+			// Skip disconnected sensors, except for RTD and NTC sensors which we want to retry
+			if (!sensor->connected && 
+				sensor->sensorType != SENSOR_PT100 && 
+				sensor->sensorType != SENSOR_PT1000 && 
+				sensor->sensorType != SENSOR_NTC)
 			{
 				continue;
 			}
@@ -3357,9 +3497,22 @@ void BrewEngine::readLoop(void *arg)
 				float v_supply = 3300.0f; // 3.3V in mV
 				float v_adc = (float)voltage_mv;
 				
-				if (v_adc <= v_supply * 0.01f) // Avoid division by zero
+				// Check for voltage ranges that indicate disconnection or short circuit
+				if (v_adc <= 10.0f) // Very low voltage - possible short circuit
 				{
 					ESP_LOGW(TAG, "NTC sensor [%s] voltage too low (%.1fmV), possible short circuit", stringId.c_str(), v_adc);
+					sensor->connected = false;
+					sensor->lastTemp = -999.0;
+					if (sensor->show)
+					{
+						instance->currentTemperatures.insert_or_assign(key, -999.0);
+					}
+					continue;
+				}
+				
+				if (v_adc >= v_supply * 0.95f) // Very high voltage - possible open circuit (disconnected)
+				{
+					ESP_LOGW(TAG, "NTC sensor [%s] voltage too high (%.1fmV), possible open circuit or disconnection", stringId.c_str(), v_adc);
 					sensor->connected = false;
 					sensor->lastTemp = -999.0;
 					if (sensor->show)
@@ -3396,8 +3549,9 @@ void BrewEngine::readLoop(void *arg)
 				// Convert to Celsius
 				temperature = temp_kelvin - 273.15f;
 				
-				// Basic sanity check - temperature should be reasonable
-				if (temperature < -50.0f || temperature > 200.0f)
+				// Sanity check - temperature should be reasonable for brewing applications
+				// Allow wider range to permit sensor recovery and different applications
+				if (temperature < -40.0f || temperature > 150.0f)
 				{
 					ESP_LOGW(TAG, "NTC sensor [%s] reading out of range: %.1f°C (R=%.1f ohms, V=%.1fmV)", 
 							stringId.c_str(), temperature, ntc_resistance, v_adc);
@@ -4803,8 +4957,13 @@ httpd_handle_t BrewEngine::startWebserver(void)
 	httpd_handle_t server = NULL;
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	// whiout this the esp crashed whitout a proper warning
-	config.stack_size = 20480;
+	config.stack_size = 32768;          // Increased from 20480 to prevent stack overflow
 	config.uri_match_fn = httpd_uri_match_wildcard;
+	config.max_open_sockets = 4;        // Reduce concurrent connections 
+	config.max_uri_handlers = 8;        // Limit URI handlers
+	config.max_resp_headers = 8;        // Limit response headers
+	config.recv_wait_timeout = 5;       // Reduce timeout to free resources faster
+	config.send_wait_timeout = 5;       // Reduce timeout to free resources faster
 
 	// Start the httpd server
 	ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
