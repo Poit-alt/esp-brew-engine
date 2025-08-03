@@ -108,6 +108,7 @@ private:
     void loadSchedule();
     void recalculateScheduleAfterOverTime();
     void stop();
+    void pause();
     void logRemote(const string &message);
     void addDefaultHeaters();
     void readHeaterSettings();
@@ -171,6 +172,12 @@ private:
 
     bool inOverTime = false; // when a step time isn't reached we go in overtime, we need this to know that we need recalcualtion
 
+    // Simplified schedule state
+    bool isHeatingPhase = true;  // true = heating to target, false = holding at target
+    system_clock::time_point holdingStartTime; // when holding phase started
+    uint16_t currentHoldingDuration = 0; // holding duration in minutes for current step
+    system_clock::time_point sessionStartTime; // when the brewing session started
+
     string statusText = "Idle";
     std::map<string, MashSchedule *> mashSchedules;
     string selectedMashScheduleName;
@@ -227,6 +234,8 @@ private:
     uint16_t firebaseSendInterval = 10; // seconds between database writes
     system_clock::time_point lastFirebaseSend;
     uint32_t currentSessionId = 0;
+    string hardwareId = "";              // Unique identifier for this controller
+    string currentBrewSession = "";      // Current active brew session ID
     
     // Firebase authentication state
     string firebaseIdToken = "";
@@ -245,8 +254,18 @@ private:
     bool isCustomTokenExpired();
     static esp_err_t http_event_handler(esp_http_client_event_t *evt);
     esp_err_t writeTemperatureToFirebase(float temperature, float targetTemperature, uint8_t pidOutput, const string &status);
+    esp_err_t writeAllSensorTemperaturesToFirebase(float avgTemperature, float targetTemperature, uint8_t pidOutput, const string &status);
     esp_err_t queryLatestTemperatureFromFirebase(float *temperature, time_t *timestamp);
     esp_err_t queryTemperatureSeriesFromFirebase(int limit);
+    
+    // Hardware ID and session management
+    void initHardwareId();
+    string generateHardwareId();
+    esp_err_t startBrewSession(const json &sessionData);
+    esp_err_t stopBrewSession();
+    esp_err_t continueBrewSession(const string &sessionId);
+    esp_err_t saveSessionState();
+    esp_err_t loadSessionState(const string &sessionId);
     json getFirebaseStatistics(const json &requestData);
     json getFirebaseSessionData(const json &requestData);
 

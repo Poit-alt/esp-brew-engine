@@ -4,6 +4,8 @@
  */
 #include "brew-engine.h"
 #include "driver/spi_master.h"
+#include "esp_system.h"
+#include "esp_mac.h"
 
 using namespace std;
 using json = nlohmann::json;
@@ -1425,6 +1427,14 @@ void BrewEngine::initFirebase()
 	this->lastFirebaseSend = system_clock::now() - seconds(this->firebaseSendInterval);
 	
 	ESP_LOGI(TAG, "initFirebase: Done - URL: %s, Session ID: %lu", this->firebaseUrl.c_str(), this->currentSessionId);
+	
+	// Initialize Hardware ID for multi-controller support
+	this->initHardwareId();
+	
+	// Don't automatically restore session on boot - let user explicitly resume
+	// Clear any previously saved session to start fresh
+	this->settingsManager->Write("curSession", "");
+	ESP_LOGI(TAG, "Controller started fresh - no active session");
 }
 
 bool BrewEngine::isFirebaseTokenValid()
@@ -1435,6 +1445,658 @@ bool BrewEngine::isFirebaseTokenValid()
     
     time_t current_time = time(NULL);
     return (current_time + 300) < this->firebaseTokenExpiresAt; // 5 minute buffer
+}
+
+void BrewEngine::initHardwareId()
+{
+    // Try to load existing Hardware ID from settings
+    string storedHardwareId = this->settingsManager->Read("hardwareId", (string)"");
+    
+    if (!storedHardwareId.empty()) {
+        this->hardwareId = storedHardwareId;
+        ESP_LOGI(TAG, "Loaded existing Hardware ID: %s", this->hardwareId.c_str());
+    } else {
+        // Generate new Hardware ID based on MAC address
+        this->hardwareId = this->generateHardwareId();
+        this->settingsManager->Write("hardwareId", this->hardwareId);
+        ESP_LOGI(TAG, "Generated new Hardware ID: %s", this->hardwareId.c_str());
+    }
+}
+
+string BrewEngine::generateHardwareId()
+{
+    uint8_t mac[6];
+    char hardwareId[32];
+    
+    // Get the ESP32's base MAC address
+    esp_err_t ret = esp_read_mac(mac, ESP_MAC_BASE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read MAC address: %s", esp_err_to_name(ret));
+        // Fallback to random ID if MAC read fails
+        snprintf(hardwareId, sizeof(hardwareId), "BREW_%08lX", esp_random());
+    } else {
+        // Create Hardware ID from MAC address: BREW_AABBCCDDEEFF
+        snprintf(hardwareId, sizeof(hardwareId), "BREW_%02X%02X%02X%02X%02X%02X", 
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    
+    return string(hardwareId);
+}
+
+esp_err_t BrewEngine::startBrewSession(const json &sessionData)
+{
+    if (!this->firebaseEnabled) {
+        ESP_LOGW(TAG, "Firebase not enabled - session will be local only");
+    }
+    
+    // Generate unique session ID with timestamp
+    time_t now = time(NULL);
+    char sessionId[64];
+    snprintf(sessionId, sizeof(sessionId), "session_%lld_%08lX", (long long)now, esp_random());
+    this->currentBrewSession = string(sessionId);
+    
+    ESP_LOGI(TAG, "Starting new brew session: %s", this->currentBrewSession.c_str());
+    
+    // Extract session name if provided
+    string sessionName = "Brew Session";
+    if (sessionData.contains("sessionName") && sessionData["sessionName"].is_string()) {
+        sessionName = sessionData["sessionName"];
+    }
+    
+    // Extract selected mash schedule if provided
+    string mashSchedule = "";
+    if (sessionData.contains("selectedMashSchedule") && sessionData["selectedMashSchedule"].is_string()) {
+        mashSchedule = sessionData["selectedMashSchedule"];
+        // Set the selected mash schedule for the brewing process
+        this->selectedMashScheduleName = mashSchedule;
+    }
+    
+    ESP_LOGI(TAG, "Session name: %s", sessionName.c_str());
+    ESP_LOGI(TAG, "Mash schedule: %s", mashSchedule.empty() ? "None" : mashSchedule.c_str());
+    
+    // Save session data locally
+    this->settingsManager->Write("curSession", this->currentBrewSession);
+    this->settingsManager->Write("sessionName_" + this->currentBrewSession, sessionName);
+    
+    // Add session to local history list
+    string existingHistory = this->settingsManager->Read("sessionHistory", (string)"");
+    json historyArray = json::array();
+    if (!existingHistory.empty()) {
+        try {
+            historyArray = json::parse(existingHistory);
+        } catch (...) {
+            historyArray = json::array();
+        }
+    }
+    
+    // Add current session to history
+    json sessionEntry;
+    sessionEntry["id"] = this->currentBrewSession;
+    sessionEntry["name"] = sessionName;
+    sessionEntry["created"] = now;
+    sessionEntry["mashSchedule"] = mashSchedule;
+    historyArray.push_back(sessionEntry);
+    
+    // Keep only last 10 sessions
+    if (historyArray.size() > 10) {
+        historyArray.erase(historyArray.begin());
+    }
+    
+    this->settingsManager->Write("sessionHistory", historyArray.dump());
+    ESP_LOGI(TAG, "Session added to local history");
+    
+    // Save session metadata to Firebase if enabled
+    if (this->firebaseEnabled) {
+        // Store session metadata in Firebase
+        esp_err_t result = this->saveSessionState();
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save session state to Firebase: %s", esp_err_to_name(result));
+        }
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t BrewEngine::stopBrewSession()
+{
+    if (this->currentBrewSession.empty()) {
+        ESP_LOGW(TAG, "No active session to stop");
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Stopping brew session: %s", this->currentBrewSession.c_str());
+    
+    // Update local session history to mark as completed
+    string localHistory = this->settingsManager->Read("sessionHistory", (string)"");
+    if (!localHistory.empty()) {
+        try {
+            json historyArray = json::parse(localHistory);
+            if (historyArray.is_array()) {
+                // Find and update the current session
+                for (auto& session : historyArray) {
+                    if (session.contains("id") && session["id"] == this->currentBrewSession) {
+                        session["status"] = "completed";
+                        session["endTime"] = time(NULL);
+                        ESP_LOGI(TAG, "Marked session as completed in local history");
+                        break;
+                    }
+                }
+                this->settingsManager->Write("sessionHistory", historyArray.dump());
+            }
+        } catch (const std::exception& e) {
+            ESP_LOGW(TAG, "Failed to update local session history: %s", e.what());
+        }
+    }
+    
+    // Mark session as completed in Firebase if enabled
+    if (this->firebaseEnabled) {
+        this->saveSessionState();
+    }
+    
+    // Stop the brewing process completely
+    this->stop();
+    
+    // Clear execution steps and mash schedule
+    for (auto const &step : this->executionSteps) {
+        delete step.second;
+    }
+    this->executionSteps.clear();
+    this->selectedMashScheduleName = "";
+    this->currentMashStep = 0;
+    this->currentExecutionStep = 0;
+    
+    // Clear current session
+    this->currentBrewSession = "";
+    this->settingsManager->Write("curSession", "");
+    
+    ESP_LOGI(TAG, "Brew session stopped completely - brewing process ended");
+    
+    return ESP_OK;
+}
+
+esp_err_t BrewEngine::continueBrewSession(const string &sessionId)
+{
+    ESP_LOGI(TAG, "Continuing brew session: %s", sessionId.c_str());
+    
+    this->currentBrewSession = sessionId;
+    this->settingsManager->Write("curSession", sessionId);
+    
+    // Load session state from Firebase if enabled
+    bool wasRunning = false;
+    bool wasBoiling = false;
+    string loadedSchedule = "";
+    
+    if (this->firebaseEnabled) {
+        esp_err_t result = this->loadSessionState(sessionId);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to load session state from Firebase: %s", esp_err_to_name(result));
+            // Continue with local session anyway
+        } else {
+            // Capture the loaded state before we modify it
+            wasRunning = this->controlRun;
+            wasBoiling = this->boilRun;
+            loadedSchedule = this->selectedMashScheduleName;
+            ESP_LOGI(TAG, "Session state loaded: wasRunning=%s, schedule=%s, steps=%d", 
+                     wasRunning ? "true" : "false", loadedSchedule.c_str(), (int)this->executionSteps.size());
+        }
+    } else {
+        ESP_LOGW(TAG, "Firebase not enabled - cannot load session state for %s", sessionId.c_str());
+        // For now, assume it was running if we're trying to continue it
+        wasRunning = true;
+        this->statusText = "Paused";
+        ESP_LOGI(TAG, "Firebase disabled - setting session to paused state for manual resume");
+    }
+    
+    // After loading session state, put the system in paused state if we have brewing data
+    // Check if session has execution steps or selected schedule (indicates active brewing session)
+    bool hasBrewingData = !this->executionSteps.empty() || !this->selectedMashScheduleName.empty();
+    
+    if (hasBrewingData) {
+        ESP_LOGI(TAG, "Session has brewing data - loading in paused state for manual resume");
+        
+        // Set to paused state - session active but controller not running
+        this->controlRun = false;  // Don't auto-start the control loop
+        this->boilRun = false;     // Don't auto-start boil
+        // Keep this->run = true so sensors continue reading!
+        this->statusText = "Paused";
+        
+        // Adjust execution step times for resumption while preserving progress
+        if (!this->executionSteps.empty()) {
+            auto now = std::chrono::system_clock::now();
+            
+            // Find the current step we should be at
+            auto currentStepIt = this->executionSteps.find(this->currentMashStep);
+            if (currentStepIt != this->executionSteps.end()) {
+                auto currentStepTime = currentStepIt->second->time;
+                auto timeOffset = now - currentStepTime;  // Time to adjust steps forward
+                
+                ESP_LOGI(TAG, "Adjusting execution steps by %ld seconds from step %d", 
+                         std::chrono::duration_cast<std::chrono::seconds>(timeOffset).count(),
+                         this->currentMashStep);
+                
+                // Only adjust future steps (current step and beyond)
+                for (auto &[stepId, step] : this->executionSteps) {
+                    if (stepId >= this->currentMashStep) {
+                        auto oldTime = step->time;
+                        step->time += timeOffset;
+                        ESP_LOGI(TAG, "SESSION LOAD: Step %d time adjusted by %ld seconds", 
+                                 stepId, std::chrono::duration_cast<std::chrono::seconds>(timeOffset).count());
+                    }
+                }
+            }
+        }
+        
+        ESP_LOGI(TAG, "Resuming from saved step: %d (execution steps: %d)", 
+                 this->currentMashStep, (int)this->executionSteps.size());
+        
+        // Keep the execution steps and mash schedule for when user clicks Resume
+        ESP_LOGI(TAG, "Session loaded in paused state with %d execution steps and schedule '%s' - ready for manual resume", 
+                 (int)this->executionSteps.size(), this->selectedMashScheduleName.c_str());
+    } else {
+        ESP_LOGI(TAG, "Session loaded but has no brewing data - staying idle");
+        this->statusText = "Idle";
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t BrewEngine::saveSessionState()
+{
+    if (!this->firebaseEnabled || this->currentBrewSession.empty()) {
+        return ESP_FAIL;
+    }
+    
+    // Create comprehensive session metadata
+    json sessionData;
+    sessionData["hardwareId"] = this->hardwareId;
+    sessionData["sessionId"] = this->currentBrewSession;
+    sessionData["lastUpdate"] = time(NULL);
+    sessionData["statusText"] = this->statusText;
+    sessionData["currentTemperature"] = this->temperature;
+    sessionData["targetTemperature"] = this->targetTemperature;
+    
+    // Get stored session name
+    string sessionName = this->settingsManager->Read("sessionName_" + this->currentBrewSession, (string)"Brew Session");
+    sessionData["sessionName"] = sessionName;
+    
+    // Save complete brewing state for resumption
+    sessionData["controlRun"] = this->controlRun;
+    sessionData["boilRun"] = this->boilRun;
+    sessionData["run"] = this->run;
+    sessionData["inOverTime"] = this->inOverTime;
+    sessionData["currentExecutionStep"] = this->currentExecutionStep;
+    sessionData["runningVersion"] = this->runningVersion;
+    
+    // Save mash schedule state
+    sessionData["selectedMashScheduleName"] = this->selectedMashScheduleName;
+    sessionData["currentMashStep"] = this->currentMashStep;
+    
+    // Save simplified schedule state
+    sessionData["isHeatingPhase"] = this->isHeatingPhase;
+    sessionData["currentHoldingDuration"] = this->currentHoldingDuration;
+    
+    // Save elapsed holding time if we're in holding phase or have completed some holding
+    if (!this->isHeatingPhase && this->currentHoldingDuration > 0) {
+        auto now = std::chrono::system_clock::now();
+        auto elapsedHoldingMinutes = std::chrono::duration_cast<std::chrono::minutes>(now - this->holdingStartTime).count();
+        sessionData["elapsedHoldingMinutes"] = elapsedHoldingMinutes;
+        ESP_LOGI(TAG, "Saving session with %ld minutes of holding time elapsed", elapsedHoldingMinutes);
+    } else {
+        sessionData["elapsedHoldingMinutes"] = 0;
+    }
+    
+    // Save session start time
+    auto sessionStartSeconds = std::chrono::duration_cast<std::chrono::seconds>(this->sessionStartTime.time_since_epoch()).count();
+    sessionData["sessionStartTime"] = sessionStartSeconds;
+    
+    // Save execution steps if they exist
+    if (!this->executionSteps.empty()) {
+        json stepsArray = json::array();
+        for (auto const &[stepId, step] : this->executionSteps) {
+            if (step != nullptr) {
+                json stepData;
+                stepData["stepId"] = stepId;
+                // Convert time_point to seconds since epoch for JSON storage
+                auto seconds = std::chrono::duration_cast<std::chrono::seconds>(step->time.time_since_epoch()).count();
+                stepData["time"] = seconds;
+                stepData["temperature"] = step->temperature;
+                stepData["extendIfNeeded"] = step->extendIfNeeded;
+                stepData["allowBoost"] = step->allowBoost;
+                stepsArray.push_back(stepData);
+            }
+        }
+        sessionData["executionSteps"] = stepsArray;
+    }
+    
+    // Save brewing statistics
+    sessionData["mashActive"] = !this->selectedMashScheduleName.empty() && this->controlRun;
+    sessionData["totalSteps"] = this->executionSteps.size();
+    
+    // Save PID settings
+    sessionData["pidOutput"] = this->pidOutput;
+    sessionData["mashkP"] = this->mashkP;
+    sessionData["mashkI"] = this->mashkI;
+    sessionData["mashkD"] = this->mashkD;
+    
+    ESP_LOGI(TAG, "Saving session state for: %s", this->currentBrewSession.c_str());
+    ESP_LOGI(TAG, "Debug - Schedule: '%s', Steps: %d, ControlRun: %s", 
+             this->selectedMashScheduleName.c_str(), 
+             (int)this->executionSteps.size(),
+             this->controlRun ? "true" : "false");
+    
+    // Ensure we have valid authentication
+    esp_err_t auth_result = ensureFirebaseAuthenticated();
+    if (auth_result != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot save session state: Firebase authentication failed");
+        return auth_result;
+    }
+    
+    // Write session metadata to Firebase
+    char url[2200];
+    int url_len = snprintf(url, sizeof(url), "%s/controllers/%s/sessions/%s/metadata.json?auth=%s", 
+                          this->firebaseUrl.c_str(), 
+                          this->hardwareId.c_str(),
+                          this->currentBrewSession.c_str(),
+                          this->firebaseIdToken.c_str());
+    
+    if (url_len >= sizeof(url) || url_len <= 0) {
+        ESP_LOGE(TAG, "Session metadata URL construction failed");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    
+    // Convert session data to JSON string
+    char *json_string = cJSON_Print(cJSON_Parse(sessionData.dump().c_str()));
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to serialize session metadata JSON");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Create HTTP client
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_PUT;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 4096;
+    config.buffer_size_tx = 4096;
+    config.timeout_ms = 10000;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client for session metadata");
+        free(json_string);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, json_string, strlen(json_string));
+    
+    ESP_LOGI(TAG, "Writing session metadata to Firebase...");
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Session metadata saved to Firebase. Status: %d", status_code);
+        
+        if (status_code != 200) {
+            ESP_LOGW(TAG, "Firebase returned non-200 status for session metadata: %d", status_code);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to save session metadata: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(json_string);
+    
+    return err;
+}
+
+esp_err_t BrewEngine::loadSessionState(const string &sessionId)
+{
+    ESP_LOGI(TAG, "Loading session state for: %s", sessionId.c_str());
+    ESP_LOGI(TAG, "Free heap before session loading: %d bytes", (int)esp_get_free_heap_size());
+    
+    if (!this->firebaseEnabled) {
+        ESP_LOGW(TAG, "Firebase not enabled - cannot load session state");
+        return ESP_FAIL;
+    }
+    
+    // Ensure we have valid authentication
+    esp_err_t auth_result = ensureFirebaseAuthenticated();
+    if (auth_result != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot load session state: Firebase authentication failed");
+        return auth_result;
+    }
+    
+    // Construct URL to fetch session metadata
+    char url[2200];
+    int url_len = snprintf(url, sizeof(url), "%s/controllers/%s/sessions/%s/metadata.json?auth=%s", 
+                          this->firebaseUrl.c_str(), 
+                          this->hardwareId.c_str(),
+                          sessionId.c_str(),
+                          this->firebaseIdToken.c_str());
+    
+    if (url_len >= sizeof(url) || url_len <= 0) {
+        ESP_LOGE(TAG, "Session metadata URL construction failed");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    
+    // Create HTTP client to fetch session metadata
+    // Use reasonable buffer size to avoid memory issues
+    char *response_buffer = (char*)malloc(8192);  // 8KB should be sufficient for session metadata
+    if (response_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate response buffer for session loading");
+        return ESP_ERR_NO_MEM;
+    }
+    memset(response_buffer, 0, 8192);
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 8192;         // Reasonable buffer size
+    config.buffer_size_tx = 4096;      // Reasonable TX buffer
+    config.timeout_ms = 15000;         // Reasonable timeout
+    config.event_handler = this->http_event_handler;
+    config.user_data = response_buffer;
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client for session loading");
+        free(response_buffer);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    ESP_LOGI(TAG, "Fetching session metadata from Firebase...");
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "Session metadata fetch status: %d", status_code);
+        
+        if (status_code == 200 && strlen(response_buffer) > 0 && strlen(response_buffer) < 8192) {
+            // Parse session metadata
+            cJSON *session_json = cJSON_Parse(response_buffer);
+            if (session_json != NULL) {
+                ESP_LOGI(TAG, "Successfully parsed session metadata");
+                
+                // Restore brewing state
+                cJSON *controlRun_item = cJSON_GetObjectItem(session_json, "controlRun");
+                if (cJSON_IsBool(controlRun_item)) {
+                    this->controlRun = cJSON_IsTrue(controlRun_item);
+                }
+                
+                cJSON *boilRun_item = cJSON_GetObjectItem(session_json, "boilRun");
+                if (cJSON_IsBool(boilRun_item)) {
+                    this->boilRun = cJSON_IsTrue(boilRun_item);
+                }
+                
+                // Don't restore the 'run' flag - always keep sensors running
+                // The 'run' flag controls sensor readings and should not be session-dependent
+                
+                cJSON *inOverTime_item = cJSON_GetObjectItem(session_json, "inOverTime");
+                if (cJSON_IsBool(inOverTime_item)) {
+                    this->inOverTime = cJSON_IsTrue(inOverTime_item);
+                }
+                
+                cJSON *currentExecutionStep_item = cJSON_GetObjectItem(session_json, "currentExecutionStep");
+                if (cJSON_IsNumber(currentExecutionStep_item)) {
+                    this->currentExecutionStep = (uint16_t)currentExecutionStep_item->valueint;
+                }
+                
+                cJSON *runningVersion_item = cJSON_GetObjectItem(session_json, "runningVersion");
+                if (cJSON_IsNumber(runningVersion_item)) {
+                    this->runningVersion = (uint16_t)runningVersion_item->valueint;
+                }
+                
+                // Restore mash schedule state
+                cJSON *selectedMashScheduleName_item = cJSON_GetObjectItem(session_json, "selectedMashScheduleName");
+                if (cJSON_IsString(selectedMashScheduleName_item)) {
+                    this->selectedMashScheduleName = selectedMashScheduleName_item->valuestring;
+                    ESP_LOGI(TAG, "Debug - Loaded schedule: '%s'", this->selectedMashScheduleName.c_str());
+                } else {
+                    ESP_LOGI(TAG, "Debug - No schedule found in session data");
+                }
+                
+                cJSON *currentMashStep_item = cJSON_GetObjectItem(session_json, "currentMashStep");
+                if (cJSON_IsNumber(currentMashStep_item)) {
+                    this->currentMashStep = (uint16_t)currentMashStep_item->valueint;
+                }
+                
+                // Restore target temperature
+                cJSON *targetTemperature_item = cJSON_GetObjectItem(session_json, "targetTemperature");
+                if (cJSON_IsNumber(targetTemperature_item)) {
+                    this->targetTemperature = (float)targetTemperature_item->valuedouble;
+                }
+                
+                // Restore simplified schedule state
+                cJSON *isHeatingPhase_item = cJSON_GetObjectItem(session_json, "isHeatingPhase");
+                if (cJSON_IsBool(isHeatingPhase_item)) {
+                    this->isHeatingPhase = cJSON_IsTrue(isHeatingPhase_item);
+                }
+                
+                cJSON *currentHoldingDuration_item = cJSON_GetObjectItem(session_json, "currentHoldingDuration");
+                if (cJSON_IsNumber(currentHoldingDuration_item)) {
+                    this->currentHoldingDuration = (uint16_t)currentHoldingDuration_item->valueint;
+                }
+                
+                // Restore elapsed holding time to preserve step progress
+                cJSON *elapsedHoldingMinutes_item = cJSON_GetObjectItem(session_json, "elapsedHoldingMinutes");
+                if (cJSON_IsNumber(elapsedHoldingMinutes_item)) {
+                    long elapsedHoldingMinutes = (long)elapsedHoldingMinutes_item->valuedouble;
+                    auto now = std::chrono::system_clock::now();
+                    
+                    // Set holding start time to now minus the elapsed time
+                    // This way, when we reach temperature or if we're already in holding phase,
+                    // the timer will show the correct remaining time
+                    this->holdingStartTime = now - std::chrono::minutes(elapsedHoldingMinutes);
+                    
+                    ESP_LOGI(TAG, "Restored %ld minutes of holding progress - holding start time set to preserve remaining time", elapsedHoldingMinutes);
+                } else {
+                    // No previous holding progress, set to current time (will be updated when holding starts)
+                    this->holdingStartTime = std::chrono::system_clock::now();
+                }
+                
+                // Restore session start time
+                cJSON *sessionStartTime_item = cJSON_GetObjectItem(session_json, "sessionStartTime");
+                if (cJSON_IsNumber(sessionStartTime_item)) {
+                    time_t sessionStartSeconds = (time_t)sessionStartTime_item->valuedouble;
+                    this->sessionStartTime = std::chrono::system_clock::from_time_t(sessionStartSeconds);
+                }
+                
+                // Restore execution steps if they exist
+                cJSON *executionSteps_item = cJSON_GetObjectItem(session_json, "executionSteps");
+                if (cJSON_IsArray(executionSteps_item)) {
+                    // Clear existing steps
+                    for (auto &[stepId, step] : this->executionSteps) {
+                        delete step;
+                    }
+                    this->executionSteps.clear();
+                    
+                    // Restore steps from session
+                    cJSON *step_item = NULL;
+                    cJSON_ArrayForEach(step_item, executionSteps_item) {
+                        if (cJSON_IsObject(step_item)) {
+                            ExecutionStep *step = new ExecutionStep();
+                            
+                            cJSON *stepId_item = cJSON_GetObjectItem(step_item, "stepId");
+                            uint16_t stepId = cJSON_IsNumber(stepId_item) ? (uint16_t)stepId_item->valueint : 0;
+                            
+                            cJSON *time_item = cJSON_GetObjectItem(step_item, "time");
+                            if (cJSON_IsNumber(time_item)) {
+                                // Convert seconds since epoch back to time_point
+                                time_t timeSeconds = (time_t)time_item->valuedouble;
+                                step->time = std::chrono::system_clock::from_time_t(timeSeconds);
+                            }
+                            
+                            cJSON *temperature_item = cJSON_GetObjectItem(step_item, "temperature");
+                            if (cJSON_IsNumber(temperature_item)) {
+                                step->temperature = (float)temperature_item->valuedouble;
+                            }
+                            
+                            cJSON *extendIfNeeded_item = cJSON_GetObjectItem(step_item, "extendIfNeeded");
+                            if (cJSON_IsBool(extendIfNeeded_item)) {
+                                step->extendIfNeeded = cJSON_IsTrue(extendIfNeeded_item);
+                            }
+                            
+                            cJSON *allowBoost_item = cJSON_GetObjectItem(step_item, "allowBoost");
+                            if (cJSON_IsBool(allowBoost_item)) {
+                                step->allowBoost = cJSON_IsTrue(allowBoost_item);
+                            }
+                            
+                            cJSON *isHoldingStep_item = cJSON_GetObjectItem(step_item, "isHoldingStep");
+                            if (cJSON_IsBool(isHoldingStep_item)) {
+                                step->isHoldingStep = cJSON_IsTrue(isHoldingStep_item);
+                            } else {
+                                step->isHoldingStep = false; // Default for backward compatibility
+                            }
+                            
+                            this->executionSteps[stepId] = step;
+                        }
+                    }
+                    ESP_LOGI(TAG, "Debug - Restored %d execution steps from session data", (int)this->executionSteps.size());
+                    
+                    // Note: Old execution step timing adjustment removed for simplified schedule system
+                }
+                
+                // Don't update status text here - let the calling function handle it
+                // Status will be set by continueBrewSession to "Paused" for manual resume
+                
+                // Set current session
+                this->currentBrewSession = sessionId;
+                this->settingsManager->Write("curSession", this->currentBrewSession);
+                
+                // Store session name locally
+                cJSON *sessionName_item = cJSON_GetObjectItem(session_json, "sessionName");
+                if (cJSON_IsString(sessionName_item)) {
+                    this->settingsManager->Write("sessionName_" + this->currentBrewSession, sessionName_item->valuestring);
+                }
+                
+                ESP_LOGI(TAG, "Session state restored successfully");
+                ESP_LOGI(TAG, "Status: %s, Control: %s, Boil: %s, Current Step: %d/%d", 
+                         this->statusText.c_str(),
+                         this->controlRun ? "YES" : "NO",
+                         this->boilRun ? "YES" : "NO",
+                         this->currentMashStep,
+                         (int)this->executionSteps.size());
+                
+                cJSON_Delete(session_json);
+                err = ESP_OK;
+            } else {
+                ESP_LOGE(TAG, "Failed to parse session metadata JSON");
+                err = ESP_ERR_INVALID_RESPONSE;
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to fetch session metadata: status %d", status_code);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to fetch session metadata: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(response_buffer);
+    return err;
 }
 
 esp_err_t BrewEngine::exchangeCustomTokenForIdToken()
@@ -2070,8 +2732,14 @@ esp_err_t BrewEngine::writeTemperatureToFirebase(float temperature, float target
     ESP_LOGI(TAG, "Firebase URL for URL construction: len=%d, first char code=%d, content: '%s'", 
              this->firebaseUrl.length(), this->firebaseUrl.empty() ? -1 : (int)this->firebaseUrl[0], this->firebaseUrl.c_str());
     
-    int url_len = snprintf(url, sizeof(url), "%s/temperatures/%lld.json?auth=%s", 
-                          this->firebaseUrl.c_str(), (long long)now, this->firebaseIdToken.c_str());
+    // Construct URL with Hardware ID and session structure
+    // New structure: /controllers/{hardwareId}/sessions/{sessionId}/temperatures/{timestamp}.json
+    int url_len = snprintf(url, sizeof(url), "%s/controllers/%s/sessions/%s/temperatures/%lld.json?auth=%s", 
+                          this->firebaseUrl.c_str(), 
+                          this->hardwareId.c_str(),
+                          this->currentBrewSession.empty() ? "default" : this->currentBrewSession.c_str(),
+                          (long long)now, 
+                          this->firebaseIdToken.c_str());
     
     // Validate URL was constructed properly
     if (url_len >= sizeof(url)) {
@@ -2158,6 +2826,177 @@ esp_err_t BrewEngine::writeTemperatureToFirebase(float temperature, float target
         ESP_LOGI(TAG, "Temperature written to Firebase. Status: %d", status_code);
     } else {
         ESP_LOGE(TAG, "Failed to write temperature: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    free(json_string);
+    cJSON_Delete(json);
+    
+    return err;
+}
+
+esp_err_t BrewEngine::writeAllSensorTemperaturesToFirebase(float avgTemperature, float targetTemperature, uint8_t pidOutput, const string &status)
+{
+    if (!this->firebaseEnabled || !this->firebaseDatabaseEnabled)
+    {
+        return ESP_FAIL;
+    }
+
+    char url[2200];  // Increased buffer size for safety
+    time_t now = time(NULL);
+    
+    // Validate Firebase URL is configured
+    if (this->firebaseUrl.empty()) {
+        ESP_LOGE(TAG, "Firebase URL not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // Ensure we have valid authentication
+    esp_err_t auth_result = ensureFirebaseAuthenticated();
+    if (auth_result != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot write sensor temperatures: Firebase authentication failed");
+        return auth_result;
+    }
+    
+    // Construct URL with Hardware ID and session structure
+    // New structure: /controllers/{hardwareId}/sessions/{sessionId}/sensorData/{timestamp}.json
+    int url_len = snprintf(url, sizeof(url), "%s/controllers/%s/sessions/%s/sensorData/%lld.json?auth=%s", 
+                          this->firebaseUrl.c_str(), 
+                          this->hardwareId.c_str(),
+                          this->currentBrewSession.empty() ? "default" : this->currentBrewSession.c_str(),
+                          (long long)now, 
+                          this->firebaseIdToken.c_str());
+    
+    // Validate URL was constructed properly
+    if (url_len >= sizeof(url)) {
+        ESP_LOGE(TAG, "URL too long: %d bytes (max %d)", url_len, (int)sizeof(url));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    
+    if (url_len <= 0) {
+        ESP_LOGE(TAG, "Failed to construct sensor data URL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Firebase sensor data URL (%d bytes): %s", url_len, url);
+    
+    // Create JSON object with all sensor data
+    cJSON *json = cJSON_CreateObject();
+    cJSON *timestamp_value = cJSON_CreateNumber(now);
+    cJSON *avg_temp_value = cJSON_CreateNumber(avgTemperature);
+    cJSON *target_value = cJSON_CreateNumber(targetTemperature);
+    cJSON *pid_value = cJSON_CreateNumber(pidOutput);
+    cJSON *status_value = cJSON_CreateString(status.c_str());
+    cJSON *hostname = cJSON_CreateString(this->Hostname.c_str());
+    cJSON *session_id = cJSON_CreateNumber(this->currentSessionId);
+    
+    // Add system data
+    cJSON_AddItemToObject(json, "timestamp", timestamp_value);
+    cJSON_AddItemToObject(json, "avgTemperature", avg_temp_value);
+    cJSON_AddItemToObject(json, "targetTemperature", target_value);
+    cJSON_AddItemToObject(json, "pidOutput", pid_value);
+    cJSON_AddItemToObject(json, "status", status_value);
+    cJSON_AddItemToObject(json, "hostname", hostname);
+    cJSON_AddItemToObject(json, "sessionId", session_id);
+    
+    // Add individual sensor temperatures
+    cJSON *sensors_obj = cJSON_CreateObject();
+    for (auto const &[sensorId, temperature] : this->currentTemperatures) {
+        // Convert sensor ID to string for JSON key
+        char sensorIdStr[32];
+        snprintf(sensorIdStr, sizeof(sensorIdStr), "%llu", (unsigned long long)sensorId);
+        
+        cJSON *sensor_data = cJSON_CreateObject();
+        cJSON *temp_value = cJSON_CreateNumber(temperature);
+        cJSON_AddItemToObject(sensor_data, "temperature", temp_value);
+        
+        // Add sensor name and properties if available
+        auto sensorIt = this->sensors.find(sensorId);
+        if (sensorIt != this->sensors.end()) {
+            TemperatureSensor *sensor = sensorIt->second;
+            if (sensor != nullptr) {
+                cJSON *name_value = cJSON_CreateString(sensor->name.c_str());
+                
+                // Convert sensor type enum to string
+                const char* sensorTypeStr = "UNKNOWN";
+                switch (sensor->sensorType) {
+                    case SENSOR_DS18B20:
+                        sensorTypeStr = "DS18B20";
+                        break;
+                    case SENSOR_PT100:
+                        sensorTypeStr = "PT100";
+                        break;
+                    case SENSOR_PT1000:
+                        sensorTypeStr = "PT1000";
+                        break;
+                    case SENSOR_NTC:
+                        sensorTypeStr = "NTC";
+                        break;
+                }
+                cJSON *type_value = cJSON_CreateString(sensorTypeStr);
+                cJSON *show_value = cJSON_CreateBool(sensor->show);
+                cJSON *color_value = cJSON_CreateString(sensor->color.c_str());
+                
+                cJSON_AddItemToObject(sensor_data, "name", name_value);
+                cJSON_AddItemToObject(sensor_data, "type", type_value);
+                cJSON_AddItemToObject(sensor_data, "show", show_value);
+                cJSON_AddItemToObject(sensor_data, "color", color_value);
+            }
+        }
+        
+        cJSON_AddItemToObject(sensors_obj, sensorIdStr, sensor_data);
+    }
+    cJSON_AddItemToObject(json, "sensors", sensors_obj);
+    
+    char *json_string = cJSON_Print(json);
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to serialize sensor data JSON - out of memory");
+        cJSON_Delete(json);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    ESP_LOGI(TAG, "Sensor data JSON payload size: %d bytes", strlen(json_string));
+    
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_PUT;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.buffer_size = 8192;      // Increased for larger sensor data
+    config.buffer_size_tx = 8192;   // Increased for larger sensor data
+    config.timeout_ms = 15000;      // 15 second timeout for larger payload
+    
+    // Validate URL format before creating client
+    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) {
+        ESP_LOGE(TAG, "Invalid URL format - must start with http:// or https://");
+        free(json_string);
+        cJSON_Delete(json);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client for sensor data");
+        free(json_string);
+        cJSON_Delete(json);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, json_string, strlen(json_string));
+    
+    ESP_LOGI(TAG, "Writing all sensor temperatures to Firebase...");
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "All sensor temperatures written to Firebase. Status: %d", status_code);
+        
+        if (status_code != 200) {
+            ESP_LOGW(TAG, "Firebase returned non-200 status: %d", status_code);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to write sensor temperatures: %s", esp_err_to_name(err));
     }
     
     esp_http_client_cleanup(client);
@@ -2848,23 +3687,52 @@ void BrewEngine::start()
 		this->inOverTime = false;
 		this->boostStatus = Off;
 		this->overrideTargetTemperature = std::nullopt;
+		
+		// Initialize simplified schedule state
+		this->isHeatingPhase = true;
+		this->currentHoldingDuration = 0;
 		// clear old temp log
 		this->tempLog.clear();
 		
 		// sensorTempLogs removed - will use database instead
 
-		// also clear old steps
-		for (auto const &step : this->executionSteps)
-		{
-			delete step.second;
+		// Check if we're resuming a session with existing execution steps
+		bool resumingSession = !this->executionSteps.empty() && !this->currentBrewSession.empty();
+		
+		if (!resumingSession) {
+			// Only clear steps if we're starting fresh, not resuming
+			for (auto const &step : this->executionSteps)
+			{
+				delete step.second;
+			}
+			this->executionSteps.clear();
 		}
-		this->executionSteps.clear();
 
 		if (this->selectedMashScheduleName.empty() == false)
 		{
-			this->loadSchedule();
-			this->currentMashStep = 1; // 0 is current temp, so we can start at 1
+			// Simplified schedule system - no execution steps needed
+			if (!resumingSession) {
+				this->currentMashStep = 1; // Start at step 1
+				this->isHeatingPhase = true; // Always start with heating phase
+				this->sessionStartTime = std::chrono::system_clock::now(); // Record session start time
+				ESP_LOGI(TAG, "Starting simplified schedule: %s at step %d", 
+						 this->selectedMashScheduleName.c_str(), this->currentMashStep);
+			} else {
+				ESP_LOGI(TAG, "Resuming simplified session at step %d, heating phase: %s", 
+					     this->currentMashStep, this->isHeatingPhase ? "true" : "false");
+			}
+			
 			xTaskCreate(&this->controlLoop, "controlloop_task", 4096, this, 5, NULL);
+			
+			// Save session state after brewing starts
+			if (this->firebaseEnabled && !this->currentBrewSession.empty()) {
+				if (!resumingSession) {
+					ESP_LOGI(TAG, "Saving session state after brewing start");
+					this->saveSessionState();
+				} else {
+					ESP_LOGI(TAG, "Resuming session - session state already saved");
+				}
+			}
 		}
 		else
 		{
@@ -2917,6 +3785,8 @@ void BrewEngine::loadSchedule()
 	execStep0->time = prevTime;
 	execStep0->temperature = prevTemp;
 	execStep0->extendIfNeeded = false;
+	execStep0->allowBoost = false;
+	execStep0->isHoldingStep = false; // Starting step is not a holding step
 	this->executionSteps.insert(std::make_pair(stepIndex, execStep0));
 
 	string iso_string = this->to_iso_8601(prevTime);
@@ -2979,6 +3849,7 @@ void BrewEngine::loadSchedule()
 				execStep->time = executionStepTime;
 				execStep->temperature = subStepTemp;
 				execStep->extendIfNeeded = false;
+				execStep->isHoldingStep = false; // These are ramping steps
 
 				if (step->allowBoost && this->boostModeUntil > 0)
 				{
@@ -3025,6 +3896,8 @@ void BrewEngine::loadSchedule()
 			execStep->time = stepEndTime;
 			execStep->temperature = (float)step->temperature;
 			execStep->extendIfNeeded = step->extendStepTimeIfNeeded;
+			execStep->allowBoost = false;
+			execStep->isHoldingStep = true; // This is a direct temp step, treat as holding
 
 			this->executionSteps.insert(std::make_pair(stepIndex, execStep));
 
@@ -3046,6 +3919,8 @@ void BrewEngine::loadSchedule()
 		holdStep->time = holdEndTime;
 		holdStep->temperature = (float)step->temperature;
 		holdStep->extendIfNeeded = false;
+		holdStep->allowBoost = false;
+		holdStep->isHoldingStep = true; // This is the holding step
 
 		this->executionSteps.insert(std::make_pair(stepIndex, holdStep));
 		stepIndex++;
@@ -3111,7 +3986,7 @@ void BrewEngine::recalculateScheduleAfterOverTime()
 		string iso_string = this->to_iso_8601(step->time);
 		string iso_string2 = this->to_iso_8601(newTime);
 
-		ESP_LOGI(TAG, "Time Changend From: %s, To:%s ", iso_string.c_str(), iso_string2.c_str());
+		ESP_LOGI(TAG, "TIMER RESET: Step %d time changed from: %s, to: %s", it->first, iso_string.c_str(), iso_string2.c_str());
 
 		step->time = newTime;
 	}
@@ -3139,6 +4014,17 @@ void BrewEngine::stop()
 	this->boostStatus = Off;
 	this->inOverTime = false;
 	this->statusText = "Idle";
+}
+
+void BrewEngine::pause()
+{
+	// Pause the controller but keep session and schedule active
+	this->controlRun = false;
+	this->boostStatus = Off;
+	// Don't reset inOverTime - keep track of overtime state
+	this->statusText = "Paused";
+	// Keep execution steps and mash schedule intact for resume
+	ESP_LOGI(TAG, "Brewing process paused - session remains active");
 }
 
 void BrewEngine::startStir(const json &stirConfig)
@@ -3664,7 +4550,7 @@ void BrewEngine::readLoop(void *arg)
 				if (timeSinceLastSend >= instance->firebaseSendInterval)
 				{
 					instance->lastFirebaseSend = now;
-					instance->writeTemperatureToFirebase(instance->temperature, instance->targetTemperature, 
+					instance->writeAllSensorTemperaturesToFirebase(instance->temperature, instance->targetTemperature, 
 						instance->pidOutput, instance->statusText);
 				}
 			}
@@ -3891,98 +4777,109 @@ void BrewEngine::controlLoop(void *arg)
 
 		system_clock::time_point now = std::chrono::system_clock::now();
 
-		if (instance->executionSteps.size() >= instance->currentMashStep)
-		{ // there are more steps
-			int nextStepIndex = instance->currentMashStep;
-
-			auto nextStep = instance->executionSteps.at(nextStepIndex);
-
-			system_clock::time_point nextAction = nextStep->time;
+		// Get current mash schedule step
+		auto pos = instance->mashSchedules.find(instance->selectedMashScheduleName);
+		if (pos != instance->mashSchedules.end() && instance->currentMashStep > 0 && instance->currentMashStep <= pos->second->steps.size())
+		{
+			auto schedule = pos->second;
+			auto currentStep = schedule->steps[instance->currentMashStep - 1]; // Convert to 0-based index
 
 			bool gotoNextStep = false;
 
-			// set target when not overriden
+			// Set target temperature
 			if (instance->overrideTargetTemperature.has_value())
 			{
 				instance->targetTemperature = instance->overrideTargetTemperature.value();
 			}
 			else
 			{
-				instance->targetTemperature = nextStep->temperature;
+				instance->targetTemperature = currentStep->temperature;
 			}
 
-			uint secondsToGo = 0;
-			// if its smaller 0 is ok!
-			if (nextAction > now)
+			// Check if we've reached target temperature (within margin)
+			bool temperatureReached = abs(instance->temperature - instance->targetTemperature) <= instance->tempMargin;
+
+			// Simplified heating/holding logic
+			if (instance->isHeatingPhase)
 			{
-				secondsToGo = chrono::duration_cast<chrono::seconds>(nextAction - now).count();
+				// HEATING PHASE: Heat to target temperature
+				if (temperatureReached)
+				{
+					// Temperature reached - switch to holding phase
+					instance->isHeatingPhase = false;
+					instance->currentHoldingDuration = currentStep->stepTime;
+					
+					// Only set fresh holding start time if we don't have a restored one
+					// Check if holdingStartTime seems reasonable (within the last 24 hours)
+					auto timeSinceHoldingStart = now - instance->holdingStartTime;
+					auto hoursSinceHoldingStart = std::chrono::duration_cast<std::chrono::hours>(timeSinceHoldingStart).count();
+					
+					if (hoursSinceHoldingStart < 0 || hoursSinceHoldingStart > 24) {
+						// holdingStartTime seems invalid or too old, set fresh start time
+						instance->holdingStartTime = now;
+						ESP_LOGI(TAG, "HEATING COMPLETE: Temperature %.1f°C reached, starting fresh holding phase for %d minutes", 
+								 instance->temperature, currentStep->stepTime);
+					} else {
+						// holdingStartTime seems valid (likely restored from session), keep it
+						auto elapsedMinutes = std::chrono::duration_cast<std::chrono::minutes>(timeSinceHoldingStart).count();
+						auto remainingMinutes = instance->currentHoldingDuration - elapsedMinutes;
+						ESP_LOGI(TAG, "HEATING COMPLETE: Temperature %.1f°C reached, continuing holding phase with %ld minutes remaining (resumed session)", 
+								 instance->temperature, std::max(0LL, remainingMinutes));
+					}
+					
+					instance->statusText = "Holding at " + std::to_string((int)instance->targetTemperature) + "°C";
+				}
+				else
+				{
+					// Still heating
+					ESP_LOGI(TAG, "HEATING: Current %.1f°C, Target %.1f°C, Diff %.1f°C", 
+							 instance->temperature, instance->targetTemperature, 
+							 instance->targetTemperature - instance->temperature);
+					instance->statusText = "Heating to " + std::to_string((int)instance->targetTemperature) + "°C";
+				}
 			}
-
-			// Boost mode logic
-			if (nextStep->allowBoost)
+			else
 			{
-				if (boostUntil == 0)
-				{
-					boostUntil = (uint)((nextStep->temperature / 100) * (float)instance->boostModeUntil);
-				}
+				// HOLDING PHASE: Hold at temperature for specified duration
+				auto holdingElapsed = chrono::duration_cast<chrono::minutes>(now - instance->holdingStartTime).count();
+				auto holdingRemaining = instance->currentHoldingDuration - holdingElapsed;
 
-				if (instance->boostStatus == Off && instance->temperature < boostUntil)
+				if (holdingElapsed >= instance->currentHoldingDuration)
 				{
-
-					ESP_LOGI(TAG, "Boost Start Until: %d", boostUntil);
-					instance->logRemote("Boost Start");
-					instance->boostStatus = Boost;
+					// Holding time complete - pause and wait for user confirmation
+					ESP_LOGI(TAG, "HOLDING COMPLETE: Step %d finished after %d minutes - waiting for user confirmation", 
+							 instance->currentMashStep, instance->currentHoldingDuration);
+					instance->statusText = "Step " + std::to_string(instance->currentMashStep) + " complete - ready to continue";
+					// Don't auto-advance - wait for user to click Continue or Skip
 				}
-				else if (instance->boostStatus == Boost && instance->temperature >= boostUntil)
+				else
 				{
-					// When in boost mode we wait unit boost temp is reched, pid is locked to 100% in boost mode
-					ESP_LOGI(TAG, "Boost Rest Start");
-					instance->logRemote("Boost Rest Start");
-					instance->boostStatus = Rest;
-				}
-				else if (instance->boostStatus == Rest && instance->temperature < prevTemperature)
-				{
-					// When in boost rest mode, we wait until temperature drops pid is locked to 0%
-					ESP_LOGI(TAG, "Boost Rest End");
-					instance->logRemote("Boost Rest End");
-					instance->boostStatus = Off;
-
-					// Reset pid
-					instance->resetPitTime = true;
+					ESP_LOGI(TAG, "HOLDING: %ld minutes elapsed, %ld minutes remaining", 
+							 holdingElapsed, holdingRemaining);
+					instance->statusText = "Holding " + std::to_string(holdingRemaining) + "m remaining";
 				}
 			}
 
-			if (secondsToGo < 1)
-			{ // change temp and increment Currentstep
-
-				// string iso_string = instance->to_iso_8601(nextStep->time);
-				// ESP_LOGI(TAG, "Control Time:%s, TempCur:%f, TempTarget:%d, Extend:%d, Overtime: %d", iso_string.c_str(), instance->temperature, nextStep->temperature, nextStep->extendIfNeeded, instance->inOverTime);
-
-				if (nextStep->extendIfNeeded == true && instance->inOverTime == false && (nextStep->temperature - instance->temperature) >= instance->tempMargin)
+			// Simple step advancement - no complex timing logic needed
+			if (gotoNextStep)
+			{
+				instance->currentMashStep++;
+				instance->overrideTargetTemperature = std::nullopt;
+				
+				// Check if we've completed all steps
+				if (instance->currentMashStep > schedule->steps.size())
 				{
-					// temp must be reached, we keep going but need to triger a recaluclation event when done
-					ESP_LOGI(TAG, "OverTime Start");
-					instance->logRemote("OverTime Start");
-					instance->inOverTime = true;
+					ESP_LOGI(TAG, "SCHEDULE COMPLETE: All steps finished");
+					instance->statusText = "Schedule Complete";
+					// Could automatically stop here or continue with final temperature
 				}
-				else if (instance->inOverTime == true && (nextStep->temperature - instance->temperature) <= instance->tempMargin)
+				else
 				{
-					// we reached out temp after overtime, we need to recalc the rest and start going again
-					ESP_LOGI(TAG, "OverTime Done");
-					instance->logRemote("OverTime Done");
-					instance->inOverTime = false;
-					instance->recalculateScheduleAfterOverTime();
-					gotoNextStep = true;
+					ESP_LOGI(TAG, "ADVANCING: Moving to step %d", instance->currentMashStep);
 				}
-				else if (instance->inOverTime == false)
-				{
-					ESP_LOGI(TAG, "Going to next Step");
-					gotoNextStep = true;
-					// also reset override on step change
-					instance->overrideTargetTemperature = std::nullopt;
-				}
-
-				// else when in overtime just keep going until we reach temp
+				
+				// Reset PID for new step
+				resetPIDNextStep = true;
 			}
 
 			// the pid needs to reset one step later so the next temp is set, oherwise it has a delay
@@ -3992,15 +4889,7 @@ void BrewEngine::controlLoop(void *arg)
 				instance->resetPitTime = true;
 			}
 
-			if (gotoNextStep)
-			{
-				instance->currentMashStep++;
-
-				// Also reset boost
-				instance->boostStatus = Off;
-
-				resetPIDNextStep = true;
-			}
+			// Note: Removed duplicate gotoNextStep handling - using simplified schedule system above
 
 			// notifications, but only when not in overtime
 			if (!instance->inOverTime && !instance->notifications.empty())
@@ -4249,6 +5138,9 @@ string BrewEngine::processCommand(const string &payLoad)
 			{"runningVersion", this->runningVersion},
 			{"inOverTime", this->inOverTime},
 			{"boostStatus", this->boostStatus},
+			{"isHeatingPhase", this->isHeatingPhase},
+			{"currentHoldingDuration", this->currentHoldingDuration},
+			{"holdingTimeRemaining", this->isHeatingPhase ? 0 : std::max(0L, (long)this->currentHoldingDuration - (long)std::chrono::duration_cast<std::chrono::minutes>(std::chrono::system_clock::now() - this->holdingStartTime).count())},
 			{"systemInfo", {
 				{"freeHeap", freeHeap},
 				{"totalHeap", totalHeap},
@@ -4256,7 +5148,34 @@ string BrewEngine::processCommand(const string &payLoad)
 				{"memoryUsagePercent", (double)((int)(memoryUsagePercent * 10)) / 10},
 				{"cpuUsagePercent", (double)((int)(cpuUsagePercent * 10)) / 10}
 			}},
+			{"hardwareId", this->hardwareId},
+			{"currentBrewSession", this->currentBrewSession},
+			{"sessionActive", !this->currentBrewSession.empty()},
 		};
+		
+		// Include session brewing state when session is active
+		if (!this->currentBrewSession.empty()) {
+			resultData["selectedMashScheduleName"] = this->selectedMashScheduleName;
+			resultData["currentExecutionStep"] = this->currentExecutionStep;
+			resultData["currentMashStep"] = this->currentMashStep;
+			
+			// Include session start time (when brewing started)
+			auto sessionStart = std::chrono::duration_cast<std::chrono::seconds>(this->sessionStartTime.time_since_epoch()).count();
+			resultData["sessionStartTime"] = sessionStart;
+			
+			// Include execution steps if they exist
+			if (!this->executionSteps.empty()) {
+				json jExecutionSteps = json::array({});
+				for (auto const &[key, val] : this->executionSteps) {
+					json jExecutionStep = val->to_json();
+					jExecutionSteps.push_back(jExecutionStep);
+				}
+				resultData["executionSteps"] = jExecutionSteps;
+				ESP_LOGD(TAG, "Sending %d execution steps to frontend", (int)this->executionSteps.size());
+			}
+			ESP_LOGD(TAG, "Data response includes session state: schedule=%s, status=%s", 
+					 this->selectedMashScheduleName.c_str(), this->statusText.c_str());
+		}
 
 		if (this->manualOverrideOutput.has_value())
 		{
@@ -4373,6 +5292,62 @@ string BrewEngine::processCommand(const string &payLoad)
 		{
 			// Session metadata is now tracked by local statistics manager
 			ESP_LOGI(TAG, "Session ended - metadata logged locally");
+		}
+	}
+	else if (command == "Pause")
+	{
+		this->pause();
+		// Save session state when pausing so we can resume properly
+		if (this->firebaseEnabled && !this->currentBrewSession.empty()) {
+			this->saveSessionState();
+		}
+	}
+	else if (command == "ContinueToNextStep")
+	{
+		// Find the current mash schedule
+		auto pos = this->mashSchedules.find(this->selectedMashScheduleName);
+		if (this->controlRun && pos != this->mashSchedules.end() && this->currentMashStep <= pos->second->steps.size()) {
+			// Move to next step and start heating phase
+			this->currentMashStep++;
+			this->isHeatingPhase = true; // Next step starts with heating
+			this->overrideTargetTemperature = std::nullopt;
+			
+			// Update target temperature to the new current step
+			if (this->currentMashStep <= pos->second->steps.size()) {
+				auto currentStep = pos->second->steps[this->currentMashStep - 1]; // Convert to 0-based index
+				this->targetTemperature = currentStep->temperature;
+				ESP_LOGI(TAG, "Updated target temperature to %.1f°C for step %d", this->targetTemperature, this->currentMashStep);
+			}
+			
+			ESP_LOGI(TAG, "Continued to next step: %d", this->currentMashStep);
+			message = "Continued to next step";
+		} else {
+			message = "Cannot continue - not in brewing mode or already at final step";
+			success = false;
+		}
+	}
+	else if (command == "SkipToNextStep")
+	{
+		// Find the current mash schedule
+		auto pos = this->mashSchedules.find(this->selectedMashScheduleName);
+		if (this->controlRun && pos != this->mashSchedules.end() && this->currentMashStep <= pos->second->steps.size()) {
+			// Skip to next step and start heating phase
+			this->currentMashStep++;
+			this->isHeatingPhase = true; // Next step starts with heating
+			this->overrideTargetTemperature = std::nullopt;
+			
+			// Update target temperature to the new current step
+			if (this->currentMashStep <= pos->second->steps.size()) {
+				auto currentStep = pos->second->steps[this->currentMashStep - 1]; // Convert to 0-based index
+				this->targetTemperature = currentStep->temperature;
+				ESP_LOGI(TAG, "Updated target temperature to %.1f°C for step %d", this->targetTemperature, this->currentMashStep);
+			}
+			
+			ESP_LOGI(TAG, "Skipped to next step: %d", this->currentMashStep);
+			message = "Skipped to next step";
+		} else {
+			message = "Cannot skip - not in brewing mode or already at final step";
+			success = false;
 		}
 	}
 	else if (command == "StopStir")
@@ -4877,6 +5852,276 @@ string BrewEngine::processCommand(const string &payLoad)
 				success = false;
 			}
 		}
+	}
+	else if (command == "StartBrewSession")
+	{
+		json sessionData = data.value("sessionData", json{});
+		esp_err_t result = this->startBrewSession(sessionData);
+		if (result == ESP_OK) {
+			resultData["sessionId"] = this->currentBrewSession;
+			resultData["hardwareId"] = this->hardwareId;
+			message = "Brew session started";
+		} else {
+			message = "Failed to start brew session";
+			success = false;
+		}
+	}
+	else if (command == "StopBrewSession")
+	{
+		esp_err_t result = this->stopBrewSession();
+		if (result == ESP_OK) {
+			resultData["hardwareId"] = this->hardwareId;
+			message = "Brew session stopped";
+		} else {
+			message = "Failed to stop brew session";
+			success = false;
+		}
+	}
+	else if (command == "ContinueBrewSession")
+	{
+		if (data["sessionId"].is_null()) {
+			message = "Session ID required";
+			success = false;
+		} else {
+			string sessionId = data["sessionId"];
+			esp_err_t result = this->continueBrewSession(sessionId);
+			if (result == ESP_OK) {
+				resultData["sessionId"] = this->currentBrewSession;
+				resultData["hardwareId"] = this->hardwareId;
+				message = "Brew session continued";
+			} else {
+				message = "Failed to continue brew session";
+				success = false;
+			}
+		}
+	}
+	else if (command == "GetSessionHistory")
+	{
+		// Get session history from Firebase or local storage
+		json sessionHistory = json::array();
+		
+		ESP_LOGI(TAG, "GetSessionHistory called - Firebase enabled: %s", this->firebaseEnabled ? "YES" : "NO");
+		ESP_LOGI(TAG, "Hardware ID: %s", this->hardwareId.c_str());
+		ESP_LOGI(TAG, "Current session: %s", this->currentBrewSession.c_str());
+		
+		if (this->firebaseEnabled) {
+			// Try to get session history from Firebase
+			try {
+				char url[2200];
+				int url_len = snprintf(url, sizeof(url), "%s/controllers/%s/sessions.json?auth=%s&shallow=true", 
+									  this->firebaseUrl.c_str(), 
+									  this->hardwareId.c_str(),
+									  this->firebaseIdToken.c_str());
+				
+				ESP_LOGI(TAG, "Session history URL: %s", url);
+				
+				if (url_len > 0 && url_len < sizeof(url)) {
+					// Create HTTP client to fetch session list
+					static char response_buffer[4096] = {0};
+					memset(response_buffer, 0, sizeof(response_buffer));
+					
+					esp_http_client_config_t config = {};
+					config.url = url;
+					config.method = HTTP_METHOD_GET;
+					config.crt_bundle_attach = esp_crt_bundle_attach;
+					config.buffer_size = 4096;
+					config.timeout_ms = 10000;
+					config.event_handler = this->http_event_handler;
+					config.user_data = response_buffer;
+					
+					esp_http_client_handle_t client = esp_http_client_init(&config);
+					if (client != NULL) {
+						esp_err_t err = esp_http_client_perform(client);
+						if (err == ESP_OK) {
+							int status_code = esp_http_client_get_status_code(client);
+							ESP_LOGI(TAG, "Session history request status: %d", status_code);
+							ESP_LOGI(TAG, "Response: %s", response_buffer);
+							
+							if (status_code == 200 && strlen(response_buffer) > 0) {
+								// Parse response to get session list
+								cJSON *sessions_json = cJSON_Parse(response_buffer);
+								if (sessions_json != NULL && cJSON_IsObject(sessions_json)) {
+									// Firebase returns object with session IDs as keys
+									cJSON *session = NULL;
+									cJSON_ArrayForEach(session, sessions_json) {
+										if (session->string != NULL) {
+											string sessionId = session->string;
+											if (!sessionId.empty()) {
+												// Try to get session metadata for better display
+												json sessionInfo;
+												sessionInfo["id"] = sessionId;
+												sessionInfo["name"] = sessionId; // Default fallback
+												sessionInfo["created"] = "Unknown";
+												sessionInfo["lastModified"] = "Unknown";
+												sessionInfo["brewingState"] = "Unknown";
+												sessionInfo["currentStep"] = "";
+												sessionInfo["schedule"] = "";
+												
+												// Try to fetch session metadata from Firebase
+												char metadata_url[2200];
+												int metadata_url_len = snprintf(metadata_url, sizeof(metadata_url), 
+																			   "%s/controllers/%s/sessions/%s/metadata.json?auth=%s", 
+																			   this->firebaseUrl.c_str(), 
+																			   this->hardwareId.c_str(),
+																			   sessionId.c_str(),
+																			   this->firebaseIdToken.c_str());
+												
+												if (metadata_url_len > 0 && metadata_url_len < sizeof(metadata_url)) {
+													// Quick metadata fetch (separate client for simplicity)
+													char meta_buffer[1024] = {0};
+													
+													esp_http_client_config_t meta_config = {};
+													meta_config.url = metadata_url;
+													meta_config.method = HTTP_METHOD_GET;
+													meta_config.crt_bundle_attach = esp_crt_bundle_attach;
+													meta_config.timeout_ms = 5000; // Shorter timeout for metadata
+													meta_config.event_handler = this->http_event_handler;
+													meta_config.user_data = meta_buffer;
+													
+													esp_http_client_handle_t meta_client = esp_http_client_init(&meta_config);
+													if (meta_client != NULL) {
+														esp_err_t meta_err = esp_http_client_perform(meta_client);
+														if (meta_err == ESP_OK && esp_http_client_get_status_code(meta_client) == 200) {
+															cJSON *metadata_json = cJSON_Parse(meta_buffer);
+															if (metadata_json != NULL) {
+																cJSON *name_item = cJSON_GetObjectItem(metadata_json, "sessionName");
+																if (cJSON_IsString(name_item)) {
+																	sessionInfo["name"] = name_item->valuestring;
+																}
+																
+																cJSON *lastUpdate_item = cJSON_GetObjectItem(metadata_json, "lastUpdate");
+																if (cJSON_IsNumber(lastUpdate_item)) {
+																	time_t lastUpdate = (time_t)lastUpdate_item->valuedouble;
+																	char date_str[64];
+																	struct tm* timeinfo = localtime(&lastUpdate);
+																	strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+																	sessionInfo["lastModified"] = date_str;
+																}
+																
+																// Extract brewing state information
+																cJSON *statusText_item = cJSON_GetObjectItem(metadata_json, "statusText");
+																if (cJSON_IsString(statusText_item)) {
+																	sessionInfo["brewingState"] = statusText_item->valuestring;
+																}
+																
+																cJSON *selectedSchedule_item = cJSON_GetObjectItem(metadata_json, "selectedMashScheduleName");
+																if (cJSON_IsString(selectedSchedule_item)) {
+																	sessionInfo["schedule"] = selectedSchedule_item->valuestring;
+																}
+																
+																cJSON *currentStep_item = cJSON_GetObjectItem(metadata_json, "currentMashStep");
+																cJSON *totalSteps_item = cJSON_GetObjectItem(metadata_json, "totalSteps");
+																if (cJSON_IsNumber(currentStep_item) && cJSON_IsNumber(totalSteps_item)) {
+																	char step_str[32];
+																	snprintf(step_str, sizeof(step_str), "%d/%d", 
+																			currentStep_item->valueint, 
+																			totalSteps_item->valueint);
+																	sessionInfo["currentStep"] = step_str;
+																}
+																
+																cJSON_Delete(metadata_json);
+															}
+														}
+														esp_http_client_cleanup(meta_client);
+													}
+												}
+												
+												// If we still don't have a good name, try to extract from session ID
+												if (sessionInfo["name"] == sessionId && sessionId.find("session_") == 0) {
+													size_t underscore_pos = sessionId.find('_', 8);
+													if (underscore_pos != string::npos) {
+														string timestamp_str = sessionId.substr(8, underscore_pos - 8);
+														try {
+															time_t timestamp = std::stoll(timestamp_str);
+															char date_str[64];
+															struct tm* timeinfo = localtime(&timestamp);
+															strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+															if (sessionInfo["created"] == "Unknown") sessionInfo["created"] = date_str;
+															if (sessionInfo["lastModified"] == "Unknown") sessionInfo["lastModified"] = date_str;
+														} catch (...) {
+															// Keep defaults
+														}
+													}
+													sessionInfo["name"] = "Brew Session " + sessionId.substr(8, 8);
+												}
+												
+												sessionHistory.push_back(sessionInfo);
+											}
+										}
+									}
+									cJSON_Delete(sessions_json);
+								}
+							}
+						} else {
+							ESP_LOGW(TAG, "Failed to fetch session history: %s", esp_err_to_name(err));
+						}
+						esp_http_client_cleanup(client);
+					}
+				}
+			} catch (...) {
+				ESP_LOGW(TAG, "Failed to fetch session history from Firebase");
+			}
+		}
+		
+		// Check local session history first
+		string localHistory = this->settingsManager->Read("sessionHistory", (string)"");
+		if (!localHistory.empty()) {
+			try {
+				json localHistoryArray = json::parse(localHistory);
+				if (localHistoryArray.is_array()) {
+					ESP_LOGI(TAG, "Found %d sessions in local history", (int)localHistoryArray.size());
+					
+					for (auto& session : localHistoryArray) {
+						json sessionInfo;
+						sessionInfo["id"] = session.value("id", "");
+						sessionInfo["name"] = session.value("name", "Unknown Session");
+						
+						// Format created date
+						if (session.contains("created") && session["created"].is_number()) {
+							time_t created = session["created"];
+							char date_str[64];
+							struct tm* timeinfo = localtime(&created);
+							strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+							sessionInfo["created"] = date_str;
+							sessionInfo["lastModified"] = date_str;
+						} else {
+							sessionInfo["created"] = "Unknown";
+							sessionInfo["lastModified"] = "Unknown";
+						}
+						
+						sessionHistory.push_back(sessionInfo);
+					}
+				}
+			} catch (const std::exception& e) {
+				ESP_LOGW(TAG, "Failed to parse local session history: %s", e.what());
+			}
+		}
+		
+		// If still no sessions, add current session if active
+		if (sessionHistory.empty() && !this->currentBrewSession.empty()) {
+			json currentSession;
+			currentSession["id"] = this->currentBrewSession;
+			
+			// Try to get stored session name
+			string sessionName = this->settingsManager->Read("sessionName_" + this->currentBrewSession, (string)"Current Session");
+			currentSession["name"] = sessionName;
+			currentSession["created"] = "Active";
+			currentSession["lastModified"] = "Now";
+			sessionHistory.push_back(currentSession);
+			ESP_LOGI(TAG, "Added current session to history: %s", sessionName.c_str());
+		}
+		
+		ESP_LOGI(TAG, "Returning %d sessions in history", (int)sessionHistory.size());
+		resultData["sessions"] = sessionHistory;
+		message = "Session history retrieved";
+	}
+	else if (command == "GetHardwareInfo")
+	{
+		resultData["hardwareId"] = this->hardwareId;
+		resultData["currentSession"] = this->currentBrewSession;
+		resultData["firebaseEnabled"] = this->firebaseEnabled;
+		resultData["sessionActive"] = !this->currentBrewSession.empty();
+		message = "Hardware info retrieved";
 	}
 	else if (command == "SetStatisticsConfig")
 	{
